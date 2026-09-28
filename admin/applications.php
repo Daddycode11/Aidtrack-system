@@ -1,282 +1,713 @@
 <?php
+// admin/applications.php
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/notify.php';
 require_admin();
 
-// --- Handle Approve/Reject ---
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'], $_POST['id'])) {
-    $action = strtolower($_POST['action']);
-    $app_id = intval($_POST['id']);
-    $admin_id = $_SESSION['admin_id'];
+$admin_id   = $_SESSION['user']['id'] ?? 0;
+$is_sa      = is_super_admin();
+$toast_msg  = '';
+$toast_type = 'approved';
 
-    if ($action === 'rejected' && !empty($_POST['reason'])) {
-        $reason = trim($_POST['reason']);
-        $stmt = $mysqli->prepare("UPDATE applications SET status='rejected', rejection_reason=? WHERE id=?");
-        $stmt->bind_param('si', $reason, $app_id);
-        $stmt->execute();
-        $stmt->close();
+// ─────────────────────────────────────────────────────────────
+// Batch action POST
+// ─────────────────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'batch') {
+    if (!csrf_verify()) { header('Location: applications.php?err=csrf'); exit; }
 
-        $stmt = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action, details) VALUES (?, ?, 'reject', ?)");
-        $stmt->bind_param('iis', $app_id, $admin_id, $reason);
-        $stmt->execute();
-        $stmt->close();
+    $batch_action = $_POST['batch_action'] ?? '';
+    $ids          = array_map('intval', $_POST['batch_ids'] ?? []);
+    $count        = count($ids);
 
-        $stmt = $mysqli->prepare("INSERT INTO notifications (user_id, message) VALUES ((SELECT user_id FROM applications WHERE id=?), ?)");
-        $msg = "Your application has been rejected for the following reason: $reason";
-        $stmt->bind_param('is', $app_id, $msg);
-        $stmt->execute();
-        $stmt->close();
-
-        header("Location: applications.php");
-        exit;
+    if ($batch_action === 'approve' && !empty($ids)) {
+        // Bulk approve above threshold requires SA approval
+        if (!$is_sa && $count > SA_APPROVAL_BULK_THRESHOLD) {
+            create_approval_request($mysqli, $admin_id, 'bulk_approve', null,
+                ['ids' => $ids, 'count' => $count],
+                "Batch approve $count applications"
+            );
+            log_audit($mysqli, 'request_bulk_approve', 'applications', null, "Requested bulk approval for $count apps");
+            header("Location: applications.php?toast=sa_pending"); exit;
+        }
+        $processed = 0;
+        foreach ($ids as $bid) {
+            $stmt = $mysqli->prepare("UPDATE applications SET status='approved', rejection_reason=NULL WHERE id=? AND status='pending'");
+            $stmt->bind_param('i', $bid); $stmt->execute();
+            if ($stmt->affected_rows > 0) {
+                $processed++;
+                $stmt2 = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action) VALUES (?,?,'approve')");
+                $stmt2->bind_param('ii', $bid, $admin_id); $stmt2->execute(); $stmt2->close();
+                $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+                $info->bind_param('i', $bid); $info->execute();
+                $app_info = $info->get_result()->fetch_assoc(); $info->close();
+                if ($app_info) notify_status_change($mysqli, $app_info['user_id'], $app_info['type'], 'approved', $bid);
+            }
+            $stmt->close();
+        }
+        log_audit($mysqli, 'batch_approve', 'applications', null, "Batch approved $processed applications");
+        header("Location: applications.php?toast=batch_approved&count=$processed"); exit;
     }
 
-    if ($action === 'approved') {
-        $stmt = $mysqli->prepare("UPDATE applications SET status='approved', rejection_reason=NULL WHERE id=?");
-        $stmt->bind_param('i', $app_id);
-        $stmt->execute();
-        $stmt->close();
-
-        $stmt = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action) VALUES (?, ?, 'approve')");
-        $stmt->bind_param('ii', $app_id, $admin_id);
-        $stmt->execute();
-        $stmt->close();
-
-        $stmt = $mysqli->prepare("INSERT INTO notifications (user_id, message) VALUES ((SELECT user_id FROM applications WHERE id=?), 'Your application has been approved.')");
-        $stmt->bind_param('i', $app_id);
-        $stmt->execute();
-        $stmt->close();
-
-        header("Location: applications.php");
-        exit;
+    if ($batch_action === 'reject' && !empty($ids)) {
+        $reason = trim($_POST['batch_reason'] ?? 'Batch rejected by admin.');
+        $processed = 0;
+        foreach ($ids as $bid) {
+            $stmt = $mysqli->prepare("UPDATE applications SET status='rejected', rejection_reason=? WHERE id=? AND status='pending'");
+            $stmt->bind_param('si', $reason, $bid); $stmt->execute();
+            if ($stmt->affected_rows > 0) {
+                $processed++;
+                $stmt2 = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action, details) VALUES (?,?,'reject',?)");
+                $stmt2->bind_param('iis', $bid, $admin_id, $reason); $stmt2->execute(); $stmt2->close();
+                $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+                $info->bind_param('i', $bid); $info->execute();
+                $app_info = $info->get_result()->fetch_assoc(); $info->close();
+                if ($app_info) notify_status_change($mysqli, $app_info['user_id'], $app_info['type'], 'rejected', $bid);
+            }
+            $stmt->close();
+        }
+        log_audit($mysqli, 'batch_reject', 'applications', null, "Batch rejected $processed applications. Reason: $reason");
+        header("Location: applications.php?toast=batch_rejected&count=$processed"); exit;
     }
 }
 
-// --- Filters ---
+// ─────────────────────────────────────────────────────────────
+// Single approve / reject / release POST
+// ─────────────────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'], $_POST['id'])) {
+    if (!csrf_verify()) { header('Location: applications.php?err=csrf'); exit; }
+
+    $action  = strtolower($_POST['action']);
+    $app_id  = intval($_POST['id']);
+
+    // ── Reject ──
+    if ($action === 'rejected' && !empty($_POST['reason'])) {
+        $reason = trim($_POST['reason']);
+        $stmt = $mysqli->prepare("UPDATE applications SET status='rejected', rejection_reason=? WHERE id=?");
+        $stmt->bind_param('si', $reason, $app_id); $stmt->execute(); $stmt->close();
+
+        $stmt = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action, details) VALUES (?,?,'reject',?)");
+        $stmt->bind_param('iis', $app_id, $admin_id, $reason); $stmt->execute(); $stmt->close();
+
+        $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+        $info->bind_param('i', $app_id); $info->execute();
+        $app_info = $info->get_result()->fetch_assoc(); $info->close();
+        if ($app_info) notify_status_change($mysqli, $app_info['user_id'], $app_info['type'], 'rejected', $app_id);
+
+        log_audit($mysqli, 'reject_application', 'application', $app_id, "Reason: $reason");
+        header('Location: applications.php?toast=rejected'); exit;
+    }
+
+    // ── Approve ──
+    if ($action === 'approved') {
+        $amount_granted = floatval($_POST['amount_granted'] ?? 0);
+
+        if (needs_sa_approval('approve_application', ['amount_granted' => $amount_granted])) {
+            // Route to SA approval queue
+            $info = $mysqli->prepare("SELECT user_id, type, amount_requested FROM applications WHERE id=?");
+            $info->bind_param('i', $app_id); $info->execute();
+            $app_info = $info->get_result()->fetch_assoc(); $info->close();
+
+            create_approval_request($mysqli, $admin_id, 'approve_application', $app_id,
+                ['app_id' => $app_id, 'amount_granted' => $amount_granted,
+                 'app_type' => $app_info['type'] ?? '', 'user_id' => $app_info['user_id'] ?? 0],
+                "Approve application #$app_id — Amount: ₱" . number_format($amount_granted, 2)
+            );
+            log_audit($mysqli, 'request_approve_application', 'application', $app_id,
+                "Requested SA approval for ₱" . number_format($amount_granted, 2));
+            header('Location: applications.php?toast=sa_pending'); exit;
+        }
+
+        $stmt = $mysqli->prepare("UPDATE applications SET status='approved', rejection_reason=NULL, amount_granted=? WHERE id=?");
+        $stmt->bind_param('di', $amount_granted, $app_id); $stmt->execute(); $stmt->close();
+
+        $details = "Amount granted: ₱" . number_format($amount_granted, 2);
+        $stmt = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action, details) VALUES (?,?,'approve',?)");
+        $stmt->bind_param('iis', $app_id, $admin_id, $details); $stmt->execute(); $stmt->close();
+
+        $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+        $info->bind_param('i', $app_id); $info->execute();
+        $app_info = $info->get_result()->fetch_assoc(); $info->close();
+        if ($app_info) notify_status_change($mysqli, $app_info['user_id'], $app_info['type'], 'approved', $app_id);
+
+        log_audit($mysqli, 'approve_application', 'application', $app_id, $details);
+        header('Location: applications.php?toast=approved'); exit;
+    }
+
+    // ── Release ──
+    if ($action === 'release') {
+        $amount_released = floatval($_POST['amount_released'] ?? 0);
+        if ($amount_released > 0) {
+            if (needs_sa_approval('release_funds', ['amount_released' => $amount_released])) {
+                $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+                $info->bind_param('i', $app_id); $info->execute();
+                $app_info = $info->get_result()->fetch_assoc(); $info->close();
+
+                create_approval_request($mysqli, $admin_id, 'release_funds', $app_id,
+                    ['app_id' => $app_id, 'amount_released' => $amount_released,
+                     'app_type' => $app_info['type'] ?? '', 'user_id' => $app_info['user_id'] ?? 0],
+                    "Release ₱" . number_format($amount_released, 2) . " for application #$app_id"
+                );
+                log_audit($mysqli, 'request_release_funds', 'application', $app_id,
+                    "Requested SA approval to release ₱" . number_format($amount_released, 2));
+                header('Location: applications.php?toast=sa_pending'); exit;
+            }
+
+            $stmt = $mysqli->prepare("UPDATE applications SET amount_released=? WHERE id=? AND status='approved'");
+            $stmt->bind_param('di', $amount_released, $app_id); $stmt->execute(); $stmt->close();
+
+            $details = "Amount released: ₱" . number_format($amount_released, 2);
+            $stmt = $mysqli->prepare("INSERT INTO admin_actions (application_id, admin_id, action, details) VALUES (?,?,'release',?)");
+            $stmt->bind_param('iis', $app_id, $admin_id, $details); $stmt->execute(); $stmt->close();
+
+            $info = $mysqli->prepare("SELECT user_id, type FROM applications WHERE id=?");
+            $info->bind_param('i', $app_id); $info->execute();
+            $app_info = $info->get_result()->fetch_assoc(); $info->close();
+            if ($app_info) notify_status_change($mysqli, $app_info['user_id'], $app_info['type'], 'released', $app_id);
+
+            log_audit($mysqli, 'release_funds', 'application', $app_id, $details);
+            header('Location: applications.php?toast=released'); exit;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Filters & data
+// ─────────────────────────────────────────────────────────────
 $filter_status = $_GET['status'] ?? '';
-$filter_type   = $_GET['type'] ?? '';
+$filter_type   = $_GET['type']   ?? '';
 $filter_client = $_GET['client'] ?? '';
 
-$where = [];
-$params = [];
-$types = '';
-
-if ($filter_status) { $where[] = 'a.status=?'; $params[] = $filter_status; $types .= 's'; }
-if ($filter_type)   { $where[] = 'a.type=?'; $params[] = $filter_type; $types .= 's'; }
+$where = []; $params = []; $types = '';
+if ($filter_status) { $where[] = 'a.status=?';   $params[] = $filter_status; $types .= 's'; }
+if ($filter_type)   { $where[] = 'a.type=?';      $params[] = $filter_type;   $types .= 's'; }
 if ($filter_client) { $where[] = 'u.name LIKE ?'; $params[] = "%$filter_client%"; $types .= 's'; }
+$where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
 
-$where_sql = $where ? 'WHERE '.implode(' AND ', $where) : '';
-
-// --- Applications Query ---
 $stmt = $mysqli->prepare("
-    SELECT a.id, a.type, a.amount_requested, a.notes, a.status, a.date_of_request, u.name AS client_name
-    FROM applications a
-    JOIN users u ON a.user_id = u.id
-    $where_sql
-    ORDER BY a.created_at DESC
+    SELECT a.id, a.type, a.amount_requested, a.amount_granted, a.amount_released,
+           a.notes, a.status, a.date_of_request,
+           u.name AS client_name, u.barangay
+    FROM applications a JOIN users u ON a.user_id = u.id
+    $where_sql ORDER BY a.created_at DESC
 ");
-if ($params) { $stmt->bind_param($types, ...$params); }
+if ($params) $stmt->bind_param($types, ...$params);
 $stmt->execute();
 $applications = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// --- Documents Query ---
 $doc_res = $mysqli->query("
-    SELECT d.id, d.application_id, d.doc_type, d.filename, d.uploaded_at,
-           u.name AS client_name,
-           a.status AS application_status
-    FROM application_documents d
+    SELECT d.id, d.application_id, d.original_name, d.filename, d.uploaded_at,
+           u.name AS client_name, a.status AS application_status
+    FROM documents d
     JOIN applications a ON d.application_id = a.id
     JOIN users u ON a.user_id = u.id
     ORDER BY d.uploaded_at DESC
 ");
 $documents = $doc_res->fetch_all(MYSQLI_ASSOC);
+
+$pending_aids         = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
+$pending_sa_approvals = get_pending_approvals_count($mysqli);
+
+$active_page   = 'applications';
+$page_title    = 'Applications';
+$page_subtitle = 'Applications';
+$colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Applications | Admin Panel</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<title>Applications — AIDTRACK Admin</title>
+<link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="partials/admin.css">
+<script src="https://unpkg.com/lucide@latest"></script>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:'Poppins',sans-serif;background:#f4f6fc;color:#333;}
-a{text-decoration:none;}
-.app{display:flex;min-height:100vh;}
-.sidebar{width:240px;background:#FFA500;color:#fff;display:flex;flex-direction:column;min-height:100vh;box-shadow:2px 0 5px rgba(0,0,0,0.1);}
-.sidebar-logo{font-size:1.8rem;text-align:center;margin:1.5rem 0;font-weight:700;letter-spacing:1px;color:#fff;}
-.sidebar-nav a{display:flex;align-items:center;padding:0.9rem 1.5rem;color:#333;border-radius:6px;margin:0.3rem 1rem;transition:0.2s;background:#FFC04C;font-weight:500;}
-.sidebar-nav a.active,.sidebar-nav a:hover{background:#fff;color:#FFA500;box-shadow:0 2px 5px rgba(0,0,0,0.2);}
-.main{flex:1;display:flex;flex-direction:column;}
-.header{display:flex;justify-content:space-between;align-items:center;padding:1.2rem 2rem;background:#fff;border-bottom:1px solid #e0e0e0;box-shadow:0 1px 4px rgba(0,0,0,0.05);}
-.header h1{font-size:1.5rem;font-weight:600;}
-.btn-logout{background:#DC3545;color:#fff;padding:0.5rem 1.2rem;border-radius:6px;font-weight:500;transition:0.2s;}
-.btn-logout:hover{background:#c82333;}
-.content{padding:1.5rem 2rem;}
-.card{background:#fff;padding:1.2rem 1.5rem;border-radius:10px;box-shadow:0 5px 15px rgba(0,0,0,0.1);margin-bottom:1.5rem;}
-.card-title{font-weight:600;font-size:1.2rem;margin-bottom:1rem;}
-.data-table-container{overflow-x:auto;}
-.data-table-container table{width:100%;border-collapse:collapse;min-width:650px;}
-.data-table-container th,.data-table-container td{padding:0.9rem 1rem;border-bottom:1px solid #eee;text-align:left;font-size:0.9rem;}
-td.status-pending{color:#FFA500;font-weight:600;}
-td.status-approved{color:#28A745;font-weight:600;}
-td.status-rejected{color:#DC3545;font-weight:600;}
-a.action-btn,button.action-btn{margin-right:0.5rem;padding:0.3rem 0.6rem;border-radius:4px;font-size:0.85rem;color:#fff;border:none;cursor:pointer;}
-a.approve,button.approve{background:#28A745;}
-a.reject,button.reject{background:#DC3545;}
-a.delete-doc,button.delete-doc{background:#DC3545;}
-.data-table-container tr:hover{background:#f0f8ff;}
+.filter-row { display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--bg); }
+.filter-row input,.filter-row select { font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;transition:border-color .15s; }
+.filter-row input:focus,.filter-row select:focus { border-color:var(--brand); }
+.filter-row input { min-width:170px; }
+.filter-spacer { flex:1; }
+.tabs { display:flex;gap:4px;padding:14px 20px 0;border-bottom:1px solid var(--border); }
+.tab { padding:8px 16px;font-size:.8rem;font-weight:700;color:var(--muted);border-radius:8px 8px 0 0;border:1px solid transparent;border-bottom:none;cursor:pointer;transition:all .15s;background:transparent;font-family:inherit;position:relative;bottom:-1px; }
+.tab.active { color:var(--brand);background:var(--white);border-color:var(--border);border-bottom-color:var(--white); }
+.tab:hover:not(.active) { color:var(--navy); }
+.toast { position:fixed;bottom:24px;right:24px;z-index:999;display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:10px;font-size:.83rem;font-weight:600;box-shadow:0 8px 28px rgba(0,0,0,.15);animation:toastIn .3s ease,toastOut .4s ease 3s forwards; }
+.toast-approved  { background:var(--green-lt);color:var(--green);border:1px solid rgba(22,163,74,.2); }
+.toast-rejected  { background:var(--red-lt);color:var(--red);border:1px solid rgba(220,38,38,.2); }
+.toast-released  { background:var(--brand-lt);color:var(--brand);border:1px solid rgba(26,86,219,.2); }
+.toast-sa_pending { background:#f5f3ff;color:#7c3aed;border:1px solid rgba(124,58,237,.2); }
+@keyframes toastIn  { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:none} }
+@keyframes toastOut { from{opacity:1} to{opacity:0;pointer-events:none} }
+.amount { font-family:monospace;font-size:.83rem;font-weight:700; }
+.notes-cell { max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--muted);font-size:.78rem; }
+.done-label { font-size:.76rem;color:var(--muted);font-style:italic; }
+.ta-release { background:rgba(8,145,178,.08);color:#0891b2;border:1px solid rgba(8,145,178,.15);border-radius:6px;padding:4px 10px;font-size:.72rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:4px;font-family:inherit; }
+.ta-release:hover { background:rgba(8,145,178,.15); }
+.modal-amount { width:100%;font-family:inherit;font-size:.95rem;font-weight:700;color:var(--navy);background:var(--bg);border:1.5px solid var(--border);border-radius:8px;padding:10px 14px;outline:none;margin-top:8px; }
+.modal-amount:focus { border-color:var(--brand);background:var(--white);box-shadow:0 0 0 3px rgba(26,86,219,.08); }
+.modal-hint { font-size:.72rem;color:var(--muted);margin-top:6px; }
+.sa-notice { background:#f5f3ff;border:1px solid rgba(124,58,237,.2);border-radius:8px;padding:8px 12px;font-size:.74rem;color:#7c3aed;font-weight:600;display:flex;align-items:center;gap:6px;margin-top:8px; }
 </style>
 </head>
 <body>
-<div class="app">
-<aside class="sidebar">
-    <div class="sidebar-logo">AidTrack</div>
-    <nav class="sidebar-nav">
-        <a href="dashboard.php">Dashboard</a>
-        <a href="user.php">Users</a>
-        <a href="applications.php" class="active">Applications</a>
-        <a href="messages.php">Messages</a>
-        <a href="aid_history.php">Aid History</a> 
-        <a href="beneficiaries.php">Beneficiaries</a>
-    </nav>
-</aside>
 
-<div class="main">
-    <header class="header">
-        <h1>Applications</h1>
-        <a class="btn-logout" href="../logout.php">Logout</a>
-    </header>
+<?php include 'partials/sidebar.php'; ?>
+<?php include 'partials/topbar.php'; ?>
 
-    <main class="content">
-        <!-- Applications Table -->
-        <div class="card">
-            <div class="card-title">Applications Queue (<?= count($applications) ?>)</div>
-            <form method="get" style="margin-bottom:1rem;">
-                <input type="text" name="client" placeholder="Client Name" value="<?= htmlspecialchars($filter_client) ?>">
-                <select name="type">
-                    <option value="">All Types</option>
-                    <option value="burial" <?= $filter_type==='burial'?'selected':'' ?>>Burial</option>
-                    <option value="medical" <?= $filter_type==='medical'?'selected':'' ?>>Medical</option>
-                </select>
-                <select name="status">
-                    <option value="">All Status</option>
-                    <option value="pending" <?= $filter_status==='pending'?'selected':'' ?>>Pending</option>
-                    <option value="approved" <?= $filter_status==='approved'?'selected':'' ?>>Approved</option>
-                    <option value="rejected" <?= $filter_status==='rejected'?'selected':'' ?>>Rejected</option>
-                </select>
-                <button type="submit" style="padding:0.4rem 0.8rem;">Filter</button>
-            </form>
-            <div class="data-table-container">
-                <table>
+<!-- TOAST -->
+<?php if (!empty($_GET['toast'])): ?>
+<?php $t = $_GET['toast']; ?>
+<div class="toast toast-<?= $t === 'sa_pending' ? 'sa_pending' : (str_contains($t, 'reject') ? 'rejected' : 'approved') ?>">
+    <i data-lucide="<?= $t === 'sa_pending' ? 'clock' : (str_contains($t, 'reject') ? 'x-circle' : 'check-circle') ?>" style="width:16px;height:16px"></i>
+    <?= match($t) {
+        'approved'       => 'Application approved successfully.',
+        'released'       => 'Funds released successfully.',
+        'rejected'       => 'Application rejected successfully.',
+        'batch_approved' => ($_GET['count'] ?? '') . ' application(s) approved successfully.',
+        'batch_rejected' => ($_GET['count'] ?? '') . ' application(s) rejected successfully.',
+        'sa_pending'     => 'Action submitted for Super Admin approval.',
+        default          => 'Action completed.'
+    } ?>
+</div>
+<?php endif; ?>
+
+<main class="main">
+
+    <div class="page-header">
+        <div class="page-header-top">
+            <div>
+                <div class="page-title">Applications</div>
+                <div class="page-sub">Review, approve, and manage all submitted assistance requests.</div>
+            </div>
+            <div class="page-actions">
+                <span class="count-pill"><?= count($applications) ?> total</span>
+                <?php if ($is_sa && $pending_sa_approvals > 0): ?>
+                <a href="super_admin_approvals.php" class="btn btn-sm" style="background:#f5f3ff;color:#7c3aed;border:1px solid rgba(124,58,237,.2);">
+                    <i data-lucide="shield-alert" style="width:13px;height:13px"></i> SA Queue (<?= $pending_sa_approvals ?>)
+                </a>
+                <?php endif; ?>
+                <a href="applications.php" class="btn btn-outline btn-sm">
+                    <i data-lucide="refresh-cw" style="width:13px;height:13px"></i> Refresh
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <?php if (!$is_sa): ?>
+    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px 16px;font-size:.8rem;color:#1d4ed8;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:8px;">
+        <i data-lucide="info" style="width:14px;height:14px"></i>
+        Applications requesting ₱<?= number_format(SA_APPROVAL_AMOUNT_THRESHOLD, 0) ?>+ or batch operations over <?= SA_APPROVAL_BULK_THRESHOLD ?> will be routed to Super Admin for approval.
+    </div>
+    <?php endif; ?>
+
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">
+                <div class="card-title-icon cti-blue"><i data-lucide="clipboard-list" style="width:14px;height:14px"></i></div>
+                Applications Queue
+                <span class="count-pill"><?= count($applications) ?></span>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('all',this)">All</button>
+            <button class="tab" onclick="switchTab('pending',this)">
+                Pending <?php if ($pending_aids > 0): ?><span class="nav-badge" style="position:static;margin-left:6px;"><?= $pending_aids ?></span><?php endif; ?>
+            </button>
+            <button class="tab" onclick="switchTab('approved',this)">Approved</button>
+            <button class="tab" onclick="switchTab('rejected',this)">Rejected</button>
+        </div>
+
+        <form method="get" class="filter-row">
+            <i data-lucide="search" style="width:15px;height:15px;color:var(--muted)"></i>
+            <input type="text" name="client" placeholder="Search by name…" value="<?= htmlspecialchars($filter_client) ?>">
+            <select name="type">
+                <option value="">All Types</option>
+                <option value="medical"     <?= $filter_type==='medical'    ?'selected':''?>>Medical</option>
+                <option value="burial"      <?= $filter_type==='burial'     ?'selected':''?>>Burial</option>
+            </select>
+            <select name="status">
+                <option value="">All Status</option>
+                <option value="pending"  <?= $filter_status==='pending' ?'selected':''?>>Pending</option>
+                <option value="approved" <?= $filter_status==='approved'?'selected':''?>>Approved</option>
+                <option value="rejected" <?= $filter_status==='rejected'?'selected':''?>>Rejected</option>
+            </select>
+            <button type="submit" class="btn btn-primary btn-sm"><i data-lucide="filter" style="width:13px;height:13px"></i> Filter</button>
+            <div class="filter-spacer"></div>
+            <?php if ($filter_client || $filter_type || $filter_status): ?>
+            <a href="applications.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
+                <i data-lucide="x" style="width:13px;height:13px;vertical-align:middle"></i> Clear
+            </a>
+            <?php endif; ?>
+        </form>
+
+        <div class="card-body no-pad">
+            <?php if (empty($applications)): ?>
+            <div class="empty-state">
+                <div class="empty-icon"><i data-lucide="inbox" style="width:20px;height:20px"></i></div>
+                <div class="empty-text">No applications match your filters.</div>
+            </div>
+            <?php else: ?>
+            <div class="tbl-wrap">
+                <table id="applicationsTable" data-paginate="10">
                     <thead>
                         <tr>
-                            <th>ID</th>
-                            <th>Client Name</th>
-                            <th>Type</th>
-                            <th>Amount</th>
-                            <th>Notes</th>
-                            <th>Status</th>
-                            <th>Actions</th>
+                            <th style="width:30px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll(this)"></th>
+                            <th>#</th><th>Applicant</th><th>Barangay</th><th>Type</th>
+                            <th>Amount</th><th>Notes</th><th>Date</th><th>Status</th><th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
-                    <?php foreach($applications as $app): ?>
-                        <tr>
-                            <td><?= $app['id'] ?></td>
-                            <td><?= htmlspecialchars($app['client_name']) ?></td>
-                            <td><?= htmlspecialchars($app['type']) ?></td>
-                            <td><?= number_format($app['amount_requested'],2) ?></td>
-                            <td><?= htmlspecialchars($app['notes'] ?? '') ?></td>
-                            <td class="status-<?= strtolower($app['status']) ?>"><?= ucfirst($app['status']) ?></td>
-                            <td>
-                            <?php if($app['status']==='pending'): ?>
-                                <form method="post" style="display:inline;">
-                                    <input type="hidden" name="action" value="approved">
-                                    <input type="hidden" name="id" value="<?= $app['id'] ?>">
-                                    <button type="submit" class="action-btn approve">Approve</button>
-                                </form>
-                                <button class="action-btn reject" onclick="openRejectModal(<?= $app['id'] ?>, '<?= htmlspecialchars($app['client_name'],ENT_QUOTES) ?>')">Reject</button>
-                            <?php else: ?>
-                                <em>Action done</em>
+                    <?php foreach ($applications as $i => $app):
+                        $s    = strtolower($app['status']);
+                        $bc   = $s === 'approved' ? 'b-approved' : ($s === 'pending' ? 'b-pending' : 'b-rejected');
+                        $col  = $colors[$i % count($colors)];
+                        $init = implode('', array_map(fn($w) => strtoupper($w[0]), array_slice(explode(' ', $app['client_name']), 0, 2)));
+                        $needs_sa = !$is_sa && floatval($app['amount_requested']) >= SA_APPROVAL_AMOUNT_THRESHOLD;
+                    ?>
+                    <tr data-status="<?= $s ?>">
+                        <td><input type="checkbox" class="row-check" value="<?= $app['id'] ?>" data-status="<?= $s ?>" onchange="updateBatchBar()"></td>
+                        <td style="color:var(--muted);font-size:.75rem;"><a href="view_application.php?id=<?= $app['id'] ?>" style="color:var(--brand);font-weight:700;"><?= $app['id'] ?></a></td>
+                        <td>
+                            <div style="display:flex;align-items:center;gap:9px;">
+                                <div class="row-avatar" style="background:<?= $col ?>;"><?= $init ?></div>
+                                <div style="font-weight:700;color:var(--navy);font-size:.82rem;"><?= htmlspecialchars($app['client_name']) ?></div>
+                            </div>
+                        </td>
+                        <td style="color:var(--muted);"><?= htmlspecialchars($app['barangay'] ?? '—') ?></td>
+                        <td><span style="font-weight:600;"><?= htmlspecialchars(ucwords(strtolower($app['type']))) ?></span></td>
+                        <td>
+                            <span class="amount" style="<?= $needs_sa ? 'color:#7c3aed;' : '' ?>">
+                                ₱<?= number_format($app['amount_requested'], 2) ?>
+                            </span>
+                            <?php if ($needs_sa && $s === 'pending'): ?>
+                            <i data-lucide="shield" style="width:11px;height:11px;color:#7c3aed;margin-left:3px;vertical-align:middle" title="Requires SA approval"></i>
                             <?php endif; ?>
-                            </td>
-                        </tr>
+                        </td>
+                        <td><div class="notes-cell" title="<?= htmlspecialchars($app['notes'] ?? '') ?>"><?= htmlspecialchars($app['notes'] ?? '—') ?></div></td>
+                        <td style="color:var(--muted);white-space:nowrap;"><?= htmlspecialchars($app['date_of_request']) ?></td>
+                        <td><span class="badge <?= $bc ?>"><?= ucfirst($s) ?></span></td>
+                        <td>
+                            <?php if ($s === 'pending'): ?>
+                            <div class="tbl-actions">
+                                <button class="tbl-action ta-approve"
+                                        onclick="openApproveModal(<?= $app['id'] ?>, '<?= htmlspecialchars($app['client_name'], ENT_QUOTES) ?>', <?= floatval($app['amount_requested']) ?>)">
+                                    <i data-lucide="check" style="width:11px;height:11px"></i>
+                                    <?= $needs_sa ? 'Request' : 'Approve' ?>
+                                </button>
+                                <button class="tbl-action ta-reject"
+                                        onclick="openRejectModal(<?= $app['id'] ?>, '<?= htmlspecialchars($app['client_name'], ENT_QUOTES) ?>')">
+                                    <i data-lucide="x" style="width:11px;height:11px"></i> Reject
+                                </button>
+                            </div>
+                            <?php elseif ($s === 'approved' && floatval($app['amount_released'] ?? 0) == 0): ?>
+                            <div class="tbl-actions">
+                                <button class="tbl-action ta-release"
+                                        onclick="openReleaseModal(<?= $app['id'] ?>, '<?= htmlspecialchars($app['client_name'], ENT_QUOTES) ?>', <?= floatval($app['amount_granted'] ?? 0) ?>)">
+                                    <i data-lucide="banknote" style="width:11px;height:11px"></i>
+                                    <?= !$is_sa && floatval($app['amount_granted'] ?? 0) >= SA_APPROVAL_AMOUNT_THRESHOLD ? 'Request Release' : 'Release' ?>
+                                </button>
+                            </div>
+                            <?php elseif ($s === 'approved' && floatval($app['amount_released'] ?? 0) > 0): ?>
+                                <span class="done-label" style="color:var(--green);">Released ₱<?= number_format($app['amount_released'], 2) ?></span>
+                            <?php else: ?>
+                                <span class="done-label">No action</span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
                     <?php endforeach; ?>
                     </tbody>
                 </table>
             </div>
+            <?php endif; ?>
         </div>
+    </div>
 
-        <!-- Documents Table -->
-        <div class="card">
-            <div class="card-title">Uploaded Documents (<?= count($documents) ?>)</div>
-            <div class="data-table-container">
-                <table>
+    <!-- Documents -->
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">
+                <div class="card-title-icon cti-yellow"><i data-lucide="folder-open" style="width:14px;height:14px"></i></div>
+                Uploaded Documents <span class="count-pill"><?= count($documents) ?></span>
+            </div>
+        </div>
+        <div class="card-body no-pad">
+            <?php if (empty($documents)): ?>
+            <div class="empty-state">
+                <div class="empty-icon"><i data-lucide="folder" style="width:20px;height:20px"></i></div>
+                <div class="empty-text">No documents have been uploaded yet.</div>
+            </div>
+            <?php else: ?>
+            <div class="tbl-wrap">
+                <table data-paginate="10">
                     <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Client Name</th>
-                            <th>Application ID</th>
-                            <th>Document Type</th>
-                            <th>Filename</th>
-                            <th>Uploaded At</th>
-                            <th>Application Status</th>
-                            <th>Actions</th>
-                        </tr>
+                        <tr><th>Applicant</th><th>App. ID</th><th>Document</th><th>Uploaded</th><th>App. Status</th><th>Actions</th></tr>
                     </thead>
                     <tbody>
-                    <?php foreach($documents as $doc): ?>
-                        <tr>
-                            <td><?= $doc['id'] ?></td>
-                            <td><?= htmlspecialchars($doc['client_name']) ?></td>
-                            <td><?= $doc['application_id'] ?></td>
-                            <td><?= htmlspecialchars($doc['doc_type']) ?></td>
-                            <td><?= htmlspecialchars($doc['filename']) ?></td>
-                            <td><?= htmlspecialchars($doc['uploaded_at']) ?></td>
-                            <td class="status-<?= strtolower($doc['application_status']) ?>"><?= ucfirst($doc['application_status'] ?? '-') ?></td>
-                            <td>
-                                <a href="../uploads/<?= urlencode($doc['filename']) ?>" target="_blank" class="action-btn approve">View</a>
-                                <form method="post" action="delete_document.php" style="display:inline;">
+                    <?php foreach ($documents as $i => $doc):
+                        $ds  = strtolower($doc['application_status'] ?? '');
+                        $dbc = $ds === 'approved' ? 'b-approved' : ($ds === 'pending' ? 'b-pending' : 'b-rejected');
+                        $col = $colors[$i % count($colors)];
+                        $din = strtoupper(substr(trim($doc['client_name']), 0, 2));
+                    ?>
+                    <tr>
+                        <td>
+                            <div style="display:flex;align-items:center;gap:9px;">
+                                <div class="row-avatar" style="background:<?= $col ?>;"><?= $din ?></div>
+                                <div style="font-weight:700;color:var(--navy);font-size:.82rem;"><?= htmlspecialchars($doc['client_name']) ?></div>
+                            </div>
+                        </td>
+                        <td style="color:var(--muted);">#<?= $doc['application_id'] ?></td>
+                        <td style="font-weight:600;"><?= htmlspecialchars($doc['original_name'] ?? $doc['filename']) ?></td>
+                        <td style="color:var(--muted);white-space:nowrap;"><?= htmlspecialchars($doc['uploaded_at']) ?></td>
+                        <td><span class="badge <?= $dbc ?>"><?= ucfirst($ds) ?></span></td>
+                        <td>
+                            <div class="tbl-actions">
+                                <?php $ext = strtolower(pathinfo($doc['filename'], PATHINFO_EXTENSION)); ?>
+                                <button class="tbl-action ta-view" onclick="previewDoc('../uploads/<?= urlencode($doc['filename']) ?>','<?= $ext ?>','<?= htmlspecialchars($doc['original_name'] ?? $doc['filename'], ENT_QUOTES) ?>')">
+                                    <i data-lucide="eye" style="width:11px;height:11px"></i> Preview
+                                </button>
+                                <form method="post" action="delete_document.php" style="display:contents;">
+                                    <?= csrf_field() ?>
                                     <input type="hidden" name="id" value="<?= $doc['id'] ?>">
-                                    <button type="submit" class="action-btn delete-doc" onclick="return confirm('Delete this document?')">Delete</button>
+                                    <button type="submit" class="tbl-action ta-delete" onclick="return confirm('Delete this document?')">
+                                        <i data-lucide="trash-2" style="width:11px;height:11px"></i>
+                                    </button>
                                 </form>
-                            </td>
-                        </tr>
+                            </div>
+                        </td>
+                    </tr>
                     <?php endforeach; ?>
                     </tbody>
                 </table>
             </div>
+            <?php endif; ?>
         </div>
+    </div>
 
-    </main>
-</div>
+</main>
+
+<!-- BATCH BAR -->
+<div id="batchBar" style="display:none;position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:998;background:var(--navy);color:#fff;border-radius:12px;padding:10px 20px;align-items:center;gap:14px;box-shadow:0 12px 40px rgba(0,0,0,.25);font-size:.84rem;font-weight:700;">
+    <span><span id="batchCount">0</span> selected</span>
+    <button onclick="submitBatch('approve')" style="padding:6px 14px;background:var(--green);color:#fff;border:none;border-radius:8px;font-family:inherit;font-weight:700;font-size:.78rem;cursor:pointer;display:flex;align-items:center;gap:5px;">
+        <i data-lucide="check" style="width:12px;height:12px"></i> Approve All
+    </button>
+    <button onclick="submitBatch('reject')" style="padding:6px 14px;background:var(--red);color:#fff;border:none;border-radius:8px;font-family:inherit;font-weight:700;font-size:.78rem;cursor:pointer;display:flex;align-items:center;gap:5px;">
+        <i data-lucide="x" style="width:12px;height:12px"></i> Reject All
+    </button>
 </div>
 
-<!-- Rejection Modal -->
-<div id="rejectModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);justify-content:center;align-items:center;z-index:999;">
-    <div class="modal-content" style="background:#fff;padding:1.5rem;border-radius:10px;width:90%;max-width:400px;position:relative;">
-        <h3>Reject Application</h3>
-        <p id="rejectClientName"></p>
+<!-- APPROVE MODAL -->
+<div class="modal-overlay" id="approveModal">
+    <div class="modal">
+        <div class="modal-header">
+            <div class="modal-title">
+                <div class="card-title-icon cti-green" style="width:28px;height:28px;"><i data-lucide="check-circle" style="width:14px;height:14px"></i></div>
+                Approve Application
+            </div>
+            <button class="modal-close" onclick="closeApproveModal()"><i data-lucide="x" style="width:14px;height:14px"></i></button>
+        </div>
         <form method="post">
-            <input type="hidden" name="action" value="rejected">
-            <input type="hidden" name="id" id="rejectAppId" value="">
-            <textarea name="reason" placeholder="Enter rejection reason" required rows="4" style="width:100%;padding:0.5rem;margin-bottom:1rem;border-radius:5px;border:1px solid #ccc;"></textarea>
-            <div style="text-align:right;">
-                <button type="button" onclick="closeRejectModal()" style="margin-right:0.5rem;background:#6c757d;color:#fff;padding:0.5rem 1rem;border:none;border-radius:5px;">Cancel</button>
-                <button type="submit" style="background:#dc3545;color:#fff;padding:0.5rem 1rem;border:none;border-radius:5px;">Reject</button>
+            <?= csrf_field() ?>
+            <div class="modal-body">
+                <p class="modal-desc" id="approveDesc"></p>
+                <input type="hidden" name="action" value="approved">
+                <input type="hidden" name="id" id="approveAppId">
+                <label style="font-size:.76rem;font-weight:700;color:var(--slate);">Amount Granted (₱)</label>
+                <input type="number" name="amount_granted" id="approveAmount" class="modal-amount" step="0.01" min="0" placeholder="0.00" required oninput="checkSAThreshold(this.value)">
+                <div class="modal-hint">Requested: ₱<span id="approveRequested">0.00</span></div>
+                <div id="saNotice" class="sa-notice" style="display:none;">
+                    <i data-lucide="shield" style="width:14px;height:14px"></i>
+                    Amount ≥ ₱<?= number_format(SA_APPROVAL_AMOUNT_THRESHOLD, 0) ?> — this will be submitted for Super Admin approval before executing.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline btn-sm" onclick="closeApproveModal()">Cancel</button>
+                <button type="submit" id="approveSubmitBtn" class="btn btn-sm" style="background:var(--green);color:#fff;">
+                    <i data-lucide="check-circle" style="width:13px;height:13px"></i> <span id="approveSubmitLabel">Approve</span>
+                </button>
             </div>
         </form>
     </div>
 </div>
 
+<!-- RELEASE MODAL -->
+<div class="modal-overlay" id="releaseModal">
+    <div class="modal">
+        <div class="modal-header">
+            <div class="modal-title">
+                <div class="card-title-icon" style="width:28px;height:28px;background:rgba(8,145,178,.1);color:#0891b2;"><i data-lucide="banknote" style="width:14px;height:14px"></i></div>
+                Release Funds
+            </div>
+            <button class="modal-close" onclick="closeReleaseModal()"><i data-lucide="x" style="width:14px;height:14px"></i></button>
+        </div>
+        <form method="post">
+            <?= csrf_field() ?>
+            <div class="modal-body">
+                <p class="modal-desc" id="releaseDesc"></p>
+                <input type="hidden" name="action" value="release">
+                <input type="hidden" name="id" id="releaseAppId">
+                <label style="font-size:.76rem;font-weight:700;color:var(--slate);">Amount to Release (₱)</label>
+                <input type="number" name="amount_released" id="releaseAmount" class="modal-amount" step="0.01" min="0.01" placeholder="0.00" required>
+                <div class="modal-hint">Granted: ₱<span id="releaseGranted">0.00</span></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline btn-sm" onclick="closeReleaseModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary btn-sm"><i data-lucide="banknote" style="width:13px;height:13px"></i> Release Funds</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- REJECT MODAL -->
+<div class="modal-overlay" id="rejectModal">
+    <div class="modal">
+        <div class="modal-header">
+            <div class="modal-title">
+                <div class="card-title-icon cti-red" style="width:28px;height:28px;"><i data-lucide="x-circle" style="width:14px;height:14px"></i></div>
+                Reject Application
+            </div>
+            <button class="modal-close" onclick="closeRejectModal()"><i data-lucide="x" style="width:14px;height:14px"></i></button>
+        </div>
+        <form method="post">
+            <?= csrf_field() ?>
+            <div class="modal-body">
+                <p class="modal-desc" id="rejectDesc"></p>
+                <input type="hidden" name="action" value="rejected">
+                <input type="hidden" name="id" id="rejectAppId">
+                <textarea name="reason" placeholder="Enter rejection reason…" required></textarea>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline btn-sm" onclick="closeRejectModal()">Cancel</button>
+                <button type="submit" class="btn btn-danger btn-sm"><i data-lucide="x-circle" style="width:13px;height:13px"></i> Confirm Rejection</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- DOC PREVIEW MODAL -->
+<div class="modal-overlay" id="previewModal" style="z-index:1001;">
+    <div class="modal" style="max-width:700px;width:95%;">
+        <div class="modal-header">
+            <div class="modal-title">
+                <div class="card-title-icon cti-yellow" style="width:28px;height:28px;"><i data-lucide="file-search" style="width:14px;height:14px"></i></div>
+                <span id="previewTitle">Document Preview</span>
+            </div>
+            <button class="modal-close" onclick="closePreview()"><i data-lucide="x" style="width:14px;height:14px"></i></button>
+        </div>
+        <div class="modal-body" style="padding:0;text-align:center;min-height:300px;max-height:70vh;overflow:auto;background:var(--bg);" id="previewBody"></div>
+        <div class="modal-footer">
+            <a id="previewDownload" href="#" target="_blank" class="btn btn-primary btn-sm">
+                <i data-lucide="download" style="width:13px;height:13px"></i> Open in New Tab
+            </a>
+        </div>
+    </div>
+</div>
+
+<script src="partials/admin.js"></script>
 <script>
-function openRejectModal(appId, clientName){
-    document.getElementById('rejectAppId').value = appId;
-    document.getElementById('rejectClientName').textContent = `Reject ${clientName}'s application?`;
-    document.getElementById('rejectModal').style.display = 'flex';
+const SA_THRESHOLD = <?= SA_APPROVAL_AMOUNT_THRESHOLD ?>;
+const IS_SA = <?= $is_sa ? 'true' : 'false' ?>;
+
+function checkSAThreshold(val) {
+    const notice = document.getElementById('saNotice');
+    const label  = document.getElementById('approveSubmitLabel');
+    if (!IS_SA && parseFloat(val) >= SA_THRESHOLD) {
+        notice.style.display = 'flex';
+        label.textContent = 'Submit for Approval';
+    } else {
+        notice.style.display = 'none';
+        label.textContent = 'Approve';
+    }
+    lucide.createIcons();
 }
-function closeRejectModal(){document.getElementById('rejectModal').style.display='none';}
+
+function previewDoc(url, ext, name) {
+    document.getElementById('previewTitle').textContent = name;
+    document.getElementById('previewDownload').href = url;
+    const body = document.getElementById('previewBody');
+    if (['jpg','jpeg','png','gif'].includes(ext)) {
+        body.innerHTML = `<img src="${url}" style="max-width:100%;max-height:65vh;object-fit:contain;padding:16px;" alt="${name}">`;
+    } else if (ext === 'pdf') {
+        body.innerHTML = `<iframe src="${url}" style="width:100%;height:65vh;border:none;"></iframe>`;
+    } else {
+        body.innerHTML = `<div style="padding:40px;color:var(--muted);font-size:.9rem;">Preview not available. Click "Open in New Tab" to view.</div>`;
+    }
+    document.getElementById('previewModal').classList.add('open');
+}
+function closePreview() { document.getElementById('previewModal').classList.remove('open'); }
+document.getElementById('previewModal').addEventListener('click', function(e) { if (e.target === this) closePreview(); });
+
+function openApproveModal(appId, clientName, amountRequested) {
+    document.getElementById('approveAppId').value = appId;
+    document.getElementById('approveAmount').value = amountRequested.toFixed(2);
+    document.getElementById('approveRequested').textContent = amountRequested.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+    document.getElementById('approveDesc').textContent = `Approve ${clientName}'s application and set the granted amount.`;
+    checkSAThreshold(amountRequested);
+    document.getElementById('approveModal').classList.add('open');
+}
+function closeApproveModal() { document.getElementById('approveModal').classList.remove('open'); }
+document.getElementById('approveModal').addEventListener('click', function(e) { if (e.target === this) closeApproveModal(); });
+
+function openReleaseModal(appId, clientName, amountGranted) {
+    document.getElementById('releaseAppId').value = appId;
+    document.getElementById('releaseAmount').value = amountGranted > 0 ? amountGranted.toFixed(2) : '';
+    document.getElementById('releaseGranted').textContent = amountGranted.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+    document.getElementById('releaseDesc').textContent = `Release funds for ${clientName}'s approved application.`;
+    document.getElementById('releaseModal').classList.add('open');
+}
+function closeReleaseModal() { document.getElementById('releaseModal').classList.remove('open'); }
+document.getElementById('releaseModal').addEventListener('click', function(e) { if (e.target === this) closeReleaseModal(); });
+
+function openRejectModal(appId, clientName) {
+    document.getElementById('rejectAppId').value = appId;
+    document.getElementById('rejectDesc').textContent = `Reject ${clientName}'s application. Provide a reason for the applicant.`;
+    document.getElementById('rejectModal').classList.add('open');
+}
+function closeRejectModal() { document.getElementById('rejectModal').classList.remove('open'); }
+document.getElementById('rejectModal').addEventListener('click', function(e) { if (e.target === this) closeRejectModal(); });
+
+function switchTab(status, btn) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('#applicationsTable tbody tr').forEach(row => {
+        row.style.display = (status === 'all' || row.dataset.status === status) ? '' : 'none';
+    });
+}
+
+function toggleSelectAll(el) {
+    document.querySelectorAll('.row-check').forEach(c => { c.checked = el.checked; });
+    updateBatchBar();
+}
+function updateBatchBar() {
+    const checked = document.querySelectorAll('.row-check:checked');
+    const bar = document.getElementById('batchBar');
+    document.getElementById('batchCount').textContent = checked.length;
+    bar.style.display = checked.length > 0 ? 'flex' : 'none';
+}
+function submitBatch(action) {
+    const checked = document.querySelectorAll('.row-check:checked');
+    if (checked.length === 0) return;
+    let reason = '';
+    if (action === 'reject') {
+        reason = prompt('Enter rejection reason for all selected:');
+        if (!reason) return;
+    }
+    if (!confirm(`${action === 'approve' ? 'Approve' : 'Reject'} ${checked.length} application(s)?`)) return;
+    const form = document.createElement('form');
+    form.method = 'POST'; form.style.display = 'none';
+    form.innerHTML = `<input name="csrf_token" value="<?= csrf_token() ?>"><input name="action" value="batch"><input name="batch_action" value="${action}">`;
+    if (reason) form.innerHTML += `<input name="batch_reason" value="${reason.replace(/"/g,'&quot;')}">`;
+    checked.forEach(c => { form.innerHTML += `<input name="batch_ids[]" value="${c.value}">`; });
+    document.body.appendChild(form);
+    form.submit();
+}
+
+setTimeout(() => { const t = document.querySelector('.toast'); if (t) t.style.display = 'none'; }, 4500);
 </script>
 </body>
 </html>

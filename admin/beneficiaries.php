@@ -3,203 +3,205 @@
 require_once __DIR__ . '/../helpers.php';
 require_admin();
 
-// --- Beneficiary Data Query (Placeholder) ---
-$beneficiaries = [
-    ['id' => 501, 'last_name' => 'BALIGUAT', 'first_name' => 'JASON', 'barangay' => 'POBLACION', 'contact' => '0912-345-6789', 'aids_received' => 5],
-    ['id' => 502, 'last_name' => 'DELA CRUZ', 'first_name' => 'MARIA', 'barangay' => 'LOOC', 'contact' => '0998-765-4321', 'aids_received' => 2],
-    ['id' => 503, 'last_name' => 'GONZALES', 'first_name' => 'ANNA', 'barangay' => 'BANTAYAN', 'contact' => '0900-111-2222', 'aids_received' => 0],
+// --- Filter ---
+$search  = $_GET['search']   ?? '';
+$f_town  = $_GET['barangay'] ?? ''; // note: kept as 'barangay' GET/column name to avoid breaking existing DB schema/links
+
+$where = []; $params = []; $types = '';
+if ($search) { $where[] = '(u.name LIKE ? OR u.phone LIKE ?)'; $params[] = "%$search%"; $params[] = "%$search%"; $types .= 'ss'; }
+if ($f_town) { $where[] = 'u.barangay = ?'; $params[] = $f_town; $types .= 's'; }
+$where_sql = $where ? 'WHERE '.implode(' AND ', $where) : '';
+
+// Beneficiaries query
+$beneficiaries = [];
+$stmt = $mysqli->prepare("
+    SELECT u.id, u.name, u.phone, u.barangay,
+           COUNT(a.id)                                   AS total_aids,
+           SUM(a.status='approved')                      AS approved_aids,
+           MAX(a.created_at)                             AS last_request
+    FROM users u
+    LEFT JOIN applications a ON a.user_id = u.id
+    WHERE u.role = 'client'" . ($where ? ' AND ' . implode(' AND ', $where) : '') . "
+    GROUP BY u.id ORDER BY u.name ASC
+");
+if ($params) $stmt->bind_param($types, ...$params);
+$stmt->execute();
+$beneficiaries = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+// --- Static Town/Bayan list (hindi na barangay ng Calintaan lang, mga karatig-bayan) ---
+$town_list = [
+    'Calintaan',
+    'Magsaysay',
+    'Rizal',
+    'San Jose',
 ];
+sort($town_list);
+
+// Partials
+$active_page   = 'beneficiaries';
+$page_title    = 'Beneficiaries';
+$page_subtitle = 'Beneficiaries';
+$pending_aids  = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
+$colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Beneficiaries | Admin Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-/* --- Admin Dashboard CSS (Self-Contained) --- */
-
-/* Global Reset & Font */
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { 
-    font-family: 'Poppins', sans-serif; 
-    background: #f4f6fc; /* Very light background */
-    color: #333; 
-}
-a { text-decoration: none; }
-
-/* App Layout */
-.app { display: flex; min-height: 100vh; }
-
-/* Sidebar - Using colors from the MONITOR PANEL image */
-.sidebar {
-    width: 240px;
-    background-color: #FFA500; /* Orange color from the image */
-    color: #fff;
-    display: flex;
-    flex-direction: column;
-    min-height: 100vh;
-    box-shadow: 2px 0 5px rgba(0,0,0,0.1);
-}
-.sidebar-logo {
-    font-size: 1.8rem;
-    text-align: center;
-    margin: 1.5rem 0;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #fff;
-}
-.sidebar-nav a {
-    display: flex;
-    align-items: center;
-    padding: 0.9rem 1.5rem;
-    color: #333; /* Dark text for better contrast on orange */
-    border-radius: 6px;
-    margin: 0.3rem 1rem;
-    transition: 0.2s;
-    background-color: #FFC04C; /* Lighter orange for normal state */
-    font-weight: 500;
-}
-.sidebar-nav a.active,
-.sidebar-nav a:hover { 
-    background-color: #fff; /* White background on active/hover */
-    color: #FFA500; /* Orange text on active/hover */
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
-
-/* Main content */
-.main { flex: 1; display: flex; flex-direction: column; }
-.header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 1.2rem 2rem;
-    background-color: #fff;
-    border-bottom: 1px solid #e0e0e0;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-}
-.header h1 { font-size: 1.5rem; font-weight: 600; }
-.btn-logout {
-    background-color: #DC3545; /* Red color for logout */
-    color: #fff;
-    padding: 0.5rem 1.2rem;
-    border: none;
-    border-radius: 6px;
-    font-weight: 500;
-    transition: 0.2s;
-}
-.btn-logout:hover { background-color: #c82333; }
-
-/* Main Content Area */
-.content { padding: 1.5rem 2rem; }
-
-/* Card styles */
-.card {
-    background: #fff;
-    padding: 1.2rem 1.5rem;
-    border-radius: 10px;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
-}
-.section-card .card-title { 
-    font-weight: 600; 
-    font-size: 1.2rem; 
-    margin-bottom: 1rem; 
-    border-bottom: 1px solid #eee;
-    padding-bottom: 0.5rem;
-}
-.card-body { 
-    max-height: 70vh; 
-    overflow-y: auto; 
-}
-
-/* Data Table */
-.data-table-container { overflow-x: auto; }
-.data-table-container table { width: 100%; border-collapse: collapse; min-width: 700px; } /* Adjusted min-width */
-.data-table-container th, .data-table-container td { padding: 0.9rem 1rem; border-bottom: 1px solid #eee; text-align: left; font-size: 0.9rem; }
-.data-table-container th { background: #f8f8f8; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; color: #666; }
-.data-table-container tr:hover { background: #f0f8ff; }
-
-/* Status color coding (kept from Aid History) */
-td.status-pending { color: #FFA500; font-weight: 600; } 
-td.status-approved { color: #28A745; font-weight: 600; } 
-td.status-rejected { color: #DC3545; font-weight: 600; } 
-
-
-/* Responsive adjustments */
-@media (max-width: 1024px) {
-    .data-section-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 768px) {
-    .sidebar { width: 100%; height: auto; min-height: unset; border-right: none; }
-    .app { flex-direction: column; }
-    .sidebar-nav { display: flex; flex-wrap: wrap; justify-content: space-around; margin: 0 0 1rem 0; }
-    .sidebar-nav a { margin: 0.2rem; padding: 0.5rem 1rem; flex-grow: 1; justify-content: center;}
-    .sidebar-logo { display: none; }
-    .content { padding: 1rem; }
-}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Beneficiaries — AIDTRACK Admin</title>
+<link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="partials/admin.css">
+<script src="https://unpkg.com/lucide@latest"></script>
+<style>
+.aids-bar { display:flex; gap:3px; align-items:center; }
+.aids-bar-fill { height:5px; border-radius:99px; background:var(--green); }
+.aids-bar-track { width:60px; height:5px; background:var(--border); border-radius:99px; overflow:hidden; }
+.role-pill { display:inline-flex; align-items:center; gap:4px; font-size:.63rem; font-weight:700; padding:2px 9px; border-radius:99px; }
+.rp-admin  { background:var(--brand-lt); color:var(--brand); }
+.rp-client { background:var(--green-lt); color:var(--green); }
+</style>
 </head>
 <body>
-<div class="app">
-    <aside class="sidebar">
-        <div class="sidebar-logo">AidTrack</div>
-        <nav class="sidebar-nav">
-            <a href="dashboard.php">Dashboard</a>
-            <a href="user.php">Users</a>
-            <a href="applications.php">Applications</a>
-            <a href="messages.php">Messages</a>
-            <a href="aid_history.php">Aid History</a> 
-            <a href="beneficiaries.php" class="active">Beneficiaries</a> </nav>
-    </aside>
 
-    <div class="main">
-        <header class="header">
-            <h1>Registered Beneficiaries</h1>
-            <a class="btn-logout" href="../logout.php">Logout</a>
-        </header>
+<?php include 'partials/sidebar.php'; ?>
+<?php include 'partials/topbar.php'; ?>
 
-        <main class="content">
+<main class="main">
 
-            <div class="card section-card">
-                <div class="card-title">Beneficiary List (<?= count($beneficiaries) ?> Total)</div>
-                <div class="card-body">
-                    <div class="data-table-container">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Last Name</th>
-                                    <th>First Name</th>
-                                    <th>Barangay</th>
-                                    <th>Contact No.</th>
-                                    <th>Aids Received</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php foreach($beneficiaries as $b): ?>
-                                    <tr>
-                                        <td><?= htmlspecialchars($b['id']) ?></td>
-                                        <td><?= htmlspecialchars($b['last_name']) ?></td>
-                                        <td><?= htmlspecialchars($b['first_name']) ?></td>
-                                        <td><?= htmlspecialchars($b['barangay']) ?></td>
-                                        <td><?= htmlspecialchars($b['contact']) ?></td>
-                                        <td><?= htmlspecialchars($b['aids_received']) ?></td>
-                                        <td>
-                                            <a href="beneficiary_profile.php?id=<?= $b['id'] ?>">View Profile</a> | 
-                                            <a href="beneficiary_new_aid.php?id=<?= $b['id'] ?>">New Aid</a>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+    <!-- Page Header -->
+    <div class="page-header">
+        <div class="page-header-top">
+            <div>
+                <div class="page-title">Registered Beneficiaries</div>
+                <div class="page-sub">All residents registered in the AIDTRACK system as aid applicants.</div>
             </div>
-
-        </main>
+            <div class="page-actions">
+                <span class="count-pill"><?= count($beneficiaries) ?> total</span>
+                <a href="#" class="btn btn-primary btn-sm">
+                    <i data-lucide="file-down" style="width:13px;height:13px"></i> Export
+                </a>
+            </div>
+        </div>
     </div>
-</div>
+
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">
+                <div class="card-title-icon cti-blue"><i data-lucide="users" style="width:14px;height:14px"></i></div>
+                Beneficiary List
+                <span class="count-pill"><?= count($beneficiaries) ?></span>
+            </div>
+        </div>
+
+        <!-- Filter -->
+        <form method="get" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:13px 18px;border-bottom:1px solid var(--border);background:var(--bg);">
+            <i data-lucide="search" style="width:14px;height:14px;color:var(--muted)"></i>
+            <input type="text" name="search" placeholder="Search by name or phone…"
+                   value="<?= htmlspecialchars($search) ?>"
+                   style="flex:1;min-width:160px;font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
+            <select name="barangay"
+                    style="font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
+                <option value="">All Towns</option>
+                <?php foreach ($town_list as $t): ?>
+                <option value="<?= htmlspecialchars($t) ?>" <?= $f_town===$t?'selected':''?>>
+                    <?= htmlspecialchars($t) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+            <button type="submit" class="btn btn-primary btn-sm">
+                <i data-lucide="filter" style="width:13px;height:13px"></i> Filter
+            </button>
+            <?php if ($search || $f_town): ?>
+            <a href="beneficiaries.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
+                <i data-lucide="x" style="width:12px;height:12px;vertical-align:middle"></i> Clear
+            </a>
+            <?php endif; ?>
+        </form>
+
+        <div class="card-body no-pad">
+            <?php if (empty($beneficiaries)): ?>
+            <div class="empty-state">
+                <div class="empty-icon"><i data-lucide="users" style="width:20px;height:20px"></i></div>
+                <div class="empty-text">No beneficiaries match your search.</div>
+            </div>
+            <?php else: ?>
+            <div class="tbl-wrap">
+                <table data-paginate="10">
+                    <thead>
+                        <tr>
+                            <th>Beneficiary</th>
+                            <th>Phone</th>
+                            <th>Town</th>
+                            <th>Total Aids</th>
+                            <th>Approved</th>
+                            <th>Last Request</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ($beneficiaries as $i => $b):
+                        $col   = $colors[$i % count($colors)];
+                        $init  = implode('', array_map(fn($w)=>strtoupper($w[0]), array_slice(explode(' ',$b['name']),0,2)));
+                        $total = (int)$b['total_aids'];
+                        $appr  = (int)$b['approved_aids'];
+                        $pct   = $total > 0 ? min(100, round($appr/$total*100)) : 0;
+                    ?>
+                    <tr>
+                        <td>
+                            <div style="display:flex;align-items:center;gap:9px;">
+                                <div class="row-avatar" style="background:<?= $col ?>"><?= $init ?></div>
+                                <div>
+                                    <div style="font-weight:700;font-size:.82rem;color:var(--navy);"><?= htmlspecialchars($b['name']) ?></div>
+                                    <div style="font-size:.68rem;color:var(--muted);">ID #<?= $b['id'] ?></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td style="font-family:monospace;font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($b['phone'] ?? '—') ?></td>
+                        <td><?= htmlspecialchars($b['barangay'] ?? '—') ?></td>
+                        <td>
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <span style="font-weight:700;color:var(--navy);font-size:.84rem;"><?= $total ?></span>
+                                <?php if ($total > 0): ?>
+                                <div class="aids-bar-track">
+                                    <div class="aids-bar-fill" style="width:<?= $pct ?>%"></div>
+                                </div>
+                                <?php endif; ?>
+                            </div>
+                        </td>
+                        <td>
+                            <?php if ($appr > 0): ?>
+                            <span class="badge b-approved"><?= $appr ?> approved</span>
+                            <?php else: ?>
+                            <span style="font-size:.75rem;color:var(--muted);">None</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="color:var(--muted);font-size:.76rem;white-space:nowrap;">
+                            <?= $b['last_request'] ? date('M d, Y', strtotime($b['last_request'])) : '—' ?>
+                        </td>
+                        <td>
+                            <div class="tbl-actions">
+                                <a href="beneficiary_profile.php?id=<?= $b['id'] ?>" class="tbl-action ta-view">
+                                    <i data-lucide="user" style="width:11px;height:11px"></i> Profile
+                                </a>
+                                <a href="beneficiary_new_aid.php?id=<?= $b['id'] ?>" class="tbl-action ta-approve">
+                                    <i data-lucide="plus" style="width:11px;height:11px"></i> New Aid
+                                </a>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+</main>
+
+<script src="partials/admin.js"></script>
 </body>
-</html>

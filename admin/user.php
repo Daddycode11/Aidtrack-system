@@ -1,210 +1,351 @@
 <?php
-// admin/users.php
+// admin/user.php
 require_once __DIR__ . '/../helpers.php';
-require_admin(); // ensure admin or super_admin
+require_admin();
 
-// --- User Data Query (Placeholder) ---
-$users = [
-    ['id' => 1, 'name' => 'John Doe', 'email' => 'john.doe@app.com', 'role' => 'admin', 'created_at' => '2024-01-15 08:30:00'],
-    ['id' => 2, 'name' => 'Jane Smith', 'email' => 'jane.smith@app.com', 'role' => 'editor', 'created_at' => '2024-02-20 11:45:00'],
-    ['id' => 3, 'name' => 'Super User', 'email' => 'super@app.com', 'role' => 'super_admin', 'created_at' => '2023-11-01 10:00:00'],
+$admin_id = $_SESSION['user']['id'] ?? 0;
+$is_sa    = is_super_admin();
+
+// --- Handle Suspend / Activate (Super Admin only, CSRF protected) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($_POST['action'] ?? '', ['suspend_user','activate_user'])) {
+    if (!csrf_verify() || !$is_sa) { header('Location: user.php?err=forbidden'); exit; }
+    $target_id = (int)($_POST['user_id'] ?? 0);
+    $action    = $_POST['action'];
+    if ($target_id && $target_id !== $admin_id) {
+        $new_status = $action === 'suspend_user' ? 'suspended' : 'active';
+        $upd = $mysqli->prepare("UPDATE users SET status=? WHERE id=? AND role='client'");
+        $upd->bind_param('si', $new_status, $target_id);
+        $upd->execute();
+        $upd->close();
+        $audit_action = $action === 'suspend_user' ? 'suspend_account' : 'activate_account';
+        log_audit($mysqli, $audit_action, 'user', $target_id, "Account status set to: $new_status");
+        // Destroy active session for this user if suspended
+        if ($new_status === 'suspended') {
+            $mysqli->query("UPDATE users SET status='suspended' WHERE id=$target_id");
+        }
+        header('Location: user.php?toast=' . ($new_status === 'suspended' ? 'suspended' : 'activated')); exit;
+    }
+    header('Location: user.php'); exit;
+}
+
+// --- Handle Delete (POST only, CSRF protected) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete_user') {
+    if (!csrf_verify()) { header('Location: user.php?err=csrf'); exit; }
+    $del_id = (int)($_POST['user_id'] ?? 0);
+
+    if ($del_id && $del_id !== $admin_id) {
+        // Fetch target user info for logging/approval
+        $uinfo = $mysqli->prepare("SELECT name, role FROM users WHERE id=?");
+        $uinfo->bind_param('i', $del_id); $uinfo->execute();
+        $target = $uinfo->get_result()->fetch_assoc(); $uinfo->close();
+
+        if ($target && $target['role'] === 'super_admin') {
+            header('Location: user.php?toast=cannot_delete_sa'); exit;
+        }
+
+        if ($is_sa) {
+            // Super admin can delete directly
+            $stmt = $mysqli->prepare("DELETE FROM users WHERE id=? AND role != 'super_admin'");
+            $stmt->bind_param('i', $del_id); $stmt->execute(); $stmt->close();
+            log_audit($mysqli, 'delete_user', 'user', $del_id,
+                "Deleted user: " . ($target['name'] ?? "ID $del_id") . " (role: " . ($target['role'] ?? '?') . ")");
+            header('Location: user.php?toast=deleted'); exit;
+        } else {
+            // Regular admin → route through SA approval
+            create_approval_request($mysqli, $admin_id, 'delete_user', $del_id,
+                ['user_id' => $del_id, 'user_name' => $target['name'] ?? '', 'user_role' => $target['role'] ?? ''],
+                "Request to delete user: " . ($target['name'] ?? "ID $del_id")
+            );
+            log_audit($mysqli, 'request_delete_user', 'user', $del_id,
+                "Requested deletion of: " . ($target['name'] ?? "ID $del_id"));
+            header('Location: user.php?toast=delete_requested'); exit;
+        }
+    }
+    header('Location: user.php'); exit;
+}
+
+// --- Filter ---
+$search  = trim($_GET['search'] ?? '');
+$f_role  = $_GET['role'] ?? '';
+
+$where  = []; $params = []; $types = '';
+if ($search) { $where[] = '(name LIKE ? OR phone LIKE ?)'; $params[] = "%$search%"; $params[] = "%$search%"; $types .= 'ss'; }
+if ($f_role) { $where[] = 'role = ?'; $params[] = $f_role; $types .= 's'; }
+$where_sql = $where ? 'WHERE '.implode(' AND ', $where) : '';
+
+$stmt = $mysqli->prepare("
+    SELECT id, name, phone, barangay, role, status, created_at
+    FROM users $where_sql ORDER BY created_at DESC
+");
+if ($params) $stmt->bind_param($types, ...$params);
+$stmt->execute();
+$users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+// Role counts
+$role_counts = [];
+$res = $mysqli->query("SELECT role, COUNT(*) AS cnt FROM users GROUP BY role");
+while ($r = $res->fetch_assoc()) $role_counts[$r['role']] = $r['cnt'];
+
+// Partials
+$active_page   = 'users';
+$page_title    = 'User Management';
+$page_subtitle = 'Users';
+$pending_aids  = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
+$colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
+
+$role_styles = [
+    'super_admin' => ['label'=>'Super Admin', 'bg'=>'#f5f3ff', 'color'=>'#7c3aed'],
+    'admin'       => ['label'=>'Admin',        'bg'=>'var(--brand-lt)', 'color'=>'var(--brand)'],
+    'client'      => ['label'=>'Beneficiary',  'bg'=>'var(--green-lt)', 'color'=>'var(--green)'],
+    'staff'       => ['label'=>'Staff',        'bg'=>'#fff7ed', 'color'=>'#c2410c'],
 ];
-
+function role_badge(string $role): string {
+    $map = [
+        'super_admin' => ['label'=>'Super Admin', 'bg'=>'#f5f3ff',           'color'=>'#7c3aed'],
+        'admin'       => ['label'=>'Admin',        'bg'=>'#eff4ff',           'color'=>'#1a56db'],
+        'client'      => ['label'=>'Beneficiary',  'bg'=>'#f0fdf4',           'color'=>'#16a34a'],
+        'staff'       => ['label'=>'Staff',        'bg'=>'#fff7ed',           'color'=>'#c2410c'],
+    ];
+    $s = $map[$role] ?? ['label'=>ucfirst($role),'bg'=>'#f1f5f9','color'=>'#64748b'];
+    return "<span class=\"badge\" style=\"background:{$s['bg']};color:{$s['color']}\">{$s['label']}</span>";
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Users | Admin Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
-    
-    <style>
-/* --- Admin Dashboard CSS (Self-Contained) --- */
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Users — AIDTRACK Admin</title>
+<link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="partials/admin.css">
+<script src="https://unpkg.com/lucide@latest"></script>
+<style>
+.role-strip { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
+.rs-card { background:var(--white); border:1px solid var(--border); border-radius:var(--r); padding:14px 16px; display:flex; align-items:center; gap:11px; }
+.rs-icon { width:34px; height:34px; border-radius:8px; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+.rs-n { font-size:1.4rem; font-weight:800; line-height:1; }
+.rs-l { font-size:.68rem; font-weight:600; color:var(--muted); margin-top:2px; }
 
-/* Global Reset & Font */
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { 
-    font-family: 'Poppins', sans-serif; 
-    background: #f4f6fc; /* Very light background */
-    color: #333; 
-}
-a { text-decoration: none; }
+.toast { position:fixed; bottom:24px; right:24px; z-index:999; display:flex; align-items:center; gap:10px; padding:12px 18px; border-radius:10px; font-size:.83rem; font-weight:600; box-shadow:0 8px 28px rgba(0,0,0,.15); animation:toastIn .3s ease, toastOut .4s ease 3s forwards; }
+.toast-deleted          { background:var(--red-lt);    color:var(--red);    border:1px solid rgba(220,38,38,.2); }
+.toast-delete_requested { background:#f5f3ff;          color:#7c3aed;       border:1px solid rgba(124,58,237,.2); }
+.toast-cannot_delete_sa { background:var(--red-lt);    color:var(--red);    border:1px solid rgba(220,38,38,.2); }
+.toast-suspended        { background:var(--yellow-lt); color:var(--yellow); border:1px solid rgba(202,138,4,.2); }
+.toast-activated        { background:var(--green-lt);  color:var(--green);  border:1px solid rgba(22,163,74,.2); }
+.status-suspended { display:inline-flex;align-items:center;gap:4px;font-size:.63rem;font-weight:700;padding:2px 9px;border-radius:99px;background:var(--red-lt);color:var(--red); }
+.status-active    { display:inline-flex;align-items:center;gap:4px;font-size:.63rem;font-weight:700;padding:2px 9px;border-radius:99px;background:var(--green-lt);color:var(--green); }
+@keyframes toastIn  { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:none} }
+@keyframes toastOut { from{opacity:1} to{opacity:0;pointer-events:none} }
 
-/* App Layout */
-.app { display: flex; min-height: 100vh; }
-
-/* Sidebar - Using colors from the MONITOR PANEL image */
-.sidebar {
-    width: 240px;
-    background-color: #FFA500; /* Orange color from the image */
-    color: #fff;
-    display: flex;
-    flex-direction: column;
-    min-height: 100vh;
-    box-shadow: 2px 0 5px rgba(0,0,0,0.1);
-}
-.sidebar-logo {
-    font-size: 1.8rem;
-    text-align: center;
-    margin: 1.5rem 0;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #fff;
-}
-.sidebar-nav a {
-    display: flex;
-    align-items: center;
-    padding: 0.9rem 1.5rem;
-    color: #333; /* Dark text for better contrast on orange */
-    border-radius: 6px;
-    margin: 0.3rem 1rem;
-    transition: 0.2s;
-    background-color: #FFC04C; /* Lighter orange for normal state */
-    font-weight: 500;
-}
-.sidebar-nav a.active,
-.sidebar-nav a:hover { 
-    background-color: #fff; /* White background on active/hover */
-    color: #FFA500; /* Orange text on active/hover */
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
-
-/* Main content */
-.main { flex: 1; display: flex; flex-direction: column; }
-.header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 1.2rem 2rem;
-    background-color: #fff;
-    border-bottom: 1px solid #e0e0e0;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-}
-.header h1 { font-size: 1.5rem; font-weight: 600; }
-.btn-logout {
-    background-color: #DC3545; /* Red color for logout */
-    color: #fff;
-    padding: 0.5rem 1.2rem;
-    border: none;
-    border-radius: 6px;
-    font-weight: 500;
-    transition: 0.2s;
-}
-.btn-logout:hover { background-color: #c82333; }
-
-/* Main Content Area */
-.content { padding: 1.5rem 2rem; }
-
-/* Card styles */
-.card {
-    background: #fff;
-    padding: 1.2rem 1.5rem;
-    border-radius: 10px;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
-}
-.section-card .card-title { 
-    font-weight: 600; 
-    font-size: 1.2rem; 
-    margin-bottom: 1rem; 
-    border-bottom: 1px solid #eee;
-    padding-bottom: 0.5rem;
-}
-.card-body { 
-    max-height: 70vh; 
-    overflow-y: auto; 
-}
-
-/* Data Table */
-.data-table-container { overflow-x: auto; }
-.data-table-container table { width: 100%; border-collapse: collapse; min-width: 700px; } /* Adjusted min-width */
-.data-table-container th, .data-table-container td { padding: 0.9rem 1rem; border-bottom: 1px solid #eee; text-align: left; font-size: 0.9rem; }
-.data-table-container th { background: #f8f8f8; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; color: #666; }
-.data-table-container tr:hover { background: #f0f8ff; }
-
-/* Custom Status color coding for Roles */
-td.status-super_admin { color: purple; font-weight: 700; }
-td.status-admin { color: #007BFF; font-weight: 600; }
-td.status-editor { color: #28A745; font-weight: 600; }
-
-/* Generic Status color coding (kept from Aid History) */
-td.status-pending { color: #FFA500; font-weight: 600; } 
-td.status-approved { color: #28A745; font-weight: 600; } 
-td.status-rejected { color: #DC3545; font-weight: 600; } 
-
-
-/* Responsive adjustments */
-@media (max-width: 1024px) {
-    .data-section-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 768px) {
-    .sidebar { width: 100%; height: auto; min-height: unset; border-right: none; }
-    .app { flex-direction: column; }
-    .sidebar-nav { display: flex; flex-wrap: wrap; justify-content: space-around; margin: 0 0 1rem 0; }
-    .sidebar-nav a { margin: 0.2rem; padding: 0.5rem 1rem; flex-grow: 1; justify-content: center;}
-    .sidebar-logo { display: none; }
-    .content { padding: 1rem; }
-}
-    </style>
+@media(max-width:860px){ .role-strip { grid-template-columns:1fr 1fr; } }
+@media(max-width:480px){ .role-strip { grid-template-columns:1fr 1fr; } }
+</style>
 </head>
 <body>
-<div class="app">
-    <aside class="sidebar">
-        <div class="sidebar-logo">AidTrack</div>
-        <nav class="sidebar-nav">
-            <a href="dashboard.php">Dashboard</a>
-            <a href="user.php" class="active">Users</a> <a href="applications.php">Applications</a>
-            <a href="messages.php">Messages</a>
-            <a href="aid_history.php">Aid History</a> 
-            <a href="beneficiaries.php">Beneficiaries</a>
-        </nav>
-    </aside>
 
-    <div class="main">
-        <header class="header">
-            <h1>User Management</h1>
-            <a class="btn-logout" href="../logout.php">Logout</a>
-        </header>
+<?php include 'partials/sidebar.php'; ?>
+<?php include 'partials/topbar.php'; ?>
 
-        <main class="content">
-
-            <div class="card section-card">
-                <div class="card-title">System Users (<?= count($users) ?> Total)</div>
-                <div class="card-body">
-                    <div class="data-table-container">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Name</th>
-                                    <th>Email</th>
-                                    <th>Role</th>
-                                    <th>Created At</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php foreach($users as $user): ?>
-                                    <tr>
-                                        <td><?= htmlspecialchars($user['id']) ?></td>
-                                        <td><?= htmlspecialchars($user['name']) ?></td>
-                                        <td><?= htmlspecialchars($user['email']) ?></td>
-                                        <td class="status-<?= htmlspecialchars($user['role']) ?>"><?= htmlspecialchars(ucfirst($user['role'])) ?></td>
-                                        <td><?= htmlspecialchars(date('M d, Y', strtotime($user['created_at']))) ?></td>
-                                        <td>
-                                            <a href="user_edit.php?id=<?= $user['id'] ?>">Edit</a> | 
-                                            <a href="user_delete.php?id=<?= $user['id'] ?>" onclick="return confirm('Are you sure?')">Delete</a>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-
-        </main>
-    </div>
+<?php if (!empty($_GET['toast'])): ?>
+<?php $t = $_GET['toast']; ?>
+<div class="toast toast-<?= $t ?>">
+    <i data-lucide="<?= $t === 'deleted' ? 'trash-2' : ($t === 'delete_requested' ? 'clock' : 'alert-circle') ?>" style="width:15px;height:15px"></i>
+    <?= match($t) {
+        'deleted'           => 'User deleted successfully.',
+        'delete_requested'  => 'Deletion request submitted for Super Admin approval.',
+        'cannot_delete_sa'  => 'Super Admin accounts cannot be deleted.',
+        'suspended'         => 'Account suspended successfully.',
+        'activated'         => 'Account activated successfully.',
+        default             => 'Action completed.'
+    } ?>
 </div>
+<?php endif; ?>
+
+<main class="main">
+
+    <!-- Page Header -->
+    <div class="page-header">
+        <div class="page-header-top">
+            <div>
+                <div class="page-title">User Management</div>
+                <div class="page-sub">Manage all registered system users, roles, and access levels.</div>
+            </div>
+            <div class="page-actions">
+                <span class="count-pill"><?= count($users) ?> total</span>
+                <a href="user_create.php" class="btn btn-primary btn-sm">
+                    <i data-lucide="user-plus" style="width:13px;height:13px"></i> Add User
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Role Summary Strip -->
+    <div class="role-strip">
+        <?php
+        $strip = [
+            ['role'=>'client',      'label'=>'Beneficiaries', 'bg'=>'var(--green-lt)',  'color'=>'var(--green)',  'icon'=>'users'],
+            ['role'=>'admin',       'label'=>'Admins',         'bg'=>'var(--brand-lt)', 'color'=>'var(--brand)',  'icon'=>'shield-check'],
+            ['role'=>'staff',       'label'=>'Staff',          'bg'=>'#fff7ed',          'color'=>'#c2410c',       'icon'=>'user-cog'],
+            ['role'=>'super_admin', 'label'=>'Super Admins',   'bg'=>'#f5f3ff',          'color'=>'#7c3aed',       'icon'=>'crown'],
+        ];
+        foreach ($strip as $s): ?>
+        <div class="rs-card">
+            <div class="rs-icon" style="background:<?= $s['bg'] ?>;color:<?= $s['color'] ?>">
+                <i data-lucide="<?= $s['icon'] ?>" style="width:16px;height:16px"></i>
+            </div>
+            <div>
+                <div class="rs-n" style="color:<?= $s['color'] ?>"><?= $role_counts[$s['role']] ?? 0 ?></div>
+                <div class="rs-l"><?= $s['label'] ?></div>
+            </div>
+        </div>
+        <?php endforeach; ?>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <div class="card-title">
+                <div class="card-title-icon cti-blue"><i data-lucide="user-cog" style="width:14px;height:14px"></i></div>
+                System Users
+                <span class="count-pill"><?= count($users) ?></span>
+            </div>
+        </div>
+
+        <!-- Filter bar -->
+        <form method="get" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:13px 18px;border-bottom:1px solid var(--border);background:var(--bg);">
+            <i data-lucide="search" style="width:14px;height:14px;color:var(--muted)"></i>
+            <input type="text" name="search" placeholder="Search by name or phone…"
+                   value="<?= htmlspecialchars($search) ?>"
+                   style="flex:1;min-width:160px;font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
+            <select name="role" style="font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
+                <option value="">All Roles</option>
+                <option value="client"      <?= $f_role==='client'     ?'selected':''?>>Beneficiary</option>
+                <option value="admin"       <?= $f_role==='admin'      ?'selected':''?>>Admin</option>
+                <option value="staff"       <?= $f_role==='staff'      ?'selected':''?>>Staff</option>
+                <option value="super_admin" <?= $f_role==='super_admin'?'selected':''?>>Super Admin</option>
+            </select>
+            <button type="submit" class="btn btn-primary btn-sm">
+                <i data-lucide="filter" style="width:13px;height:13px"></i> Filter
+            </button>
+            <?php if ($search || $f_role): ?>
+            <a href="user.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
+                <i data-lucide="x" style="width:12px;height:12px;vertical-align:middle"></i> Clear
+            </a>
+            <?php endif; ?>
+        </form>
+
+        <div class="card-body no-pad">
+            <?php if (empty($users)): ?>
+            <div class="empty-state">
+                <div class="empty-icon"><i data-lucide="users" style="width:20px;height:20px"></i></div>
+                <div class="empty-text">No users match your search.</div>
+            </div>
+            <?php else: ?>
+            <div class="tbl-wrap">
+                <table data-paginate="10">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>Phone</th>
+                            <th>Barangay</th>
+                            <th>Role</th>
+                            <th>Status</th>
+                            <th>Joined</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ($users as $i => $u):
+                        $col  = $colors[$i % count($colors)];
+                        $init = implode('', array_map(fn($w)=>strtoupper($w[0]), array_slice(explode(' ',$u['name']),0,2)));
+                        $is_me = ($u['id'] === ($_SESSION['user']['id'] ?? 0));
+                    ?>
+                    <tr>
+                        <td>
+                            <div style="display:flex;align-items:center;gap:9px;">
+                                <div class="row-avatar" style="background:<?= $col ?>"><?= $init ?></div>
+                                <div>
+                                    <div style="font-weight:700;font-size:.82rem;color:var(--navy);">
+                                        <?= htmlspecialchars($u['name']) ?>
+                                        <?php if ($is_me): ?>
+                                        <span style="font-size:.63rem;font-weight:700;background:var(--brand-lt);color:var(--brand);padding:1px 7px;border-radius:99px;margin-left:5px;">You</span>
+                                        <?php endif; ?>
+                                    </div>
+                                    <div style="font-size:.68rem;color:var(--muted);">ID #<?= $u['id'] ?></div>
+                                </div>
+                            </div>
+                        </td>
+                        <td style="font-family:monospace;font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['phone'] ?? '—') ?></td>
+                        <td style="color:var(--muted);"><?= htmlspecialchars($u['barangay'] ?? '—') ?></td>
+                        <td><?= role_badge($u['role']) ?></td>
+                        <td>
+                            <?php $st = $u['status'] ?? 'active'; ?>
+                            <span class="status-<?= $st ?>">
+                                <i data-lucide="<?= $st === 'suspended' ? 'ban' : 'check-circle' ?>" style="width:10px;height:10px"></i>
+                                <?= ucfirst($st) ?>
+                            </span>
+                        </td>
+                        <td style="color:var(--muted);white-space:nowrap;font-size:.76rem;"><?= date('M d, Y', strtotime($u['created_at'])) ?></td>
+                        <td>
+                            <div class="tbl-actions">
+                                <a href="user_edit.php?id=<?= $u['id'] ?>" class="tbl-action ta-view">
+                                    <i data-lucide="pencil" style="width:11px;height:11px"></i> Edit
+                                </a>
+                                <?php if ($is_sa && !$is_me && $u['role'] === 'client'): ?>
+                                <?php if (($u['status'] ?? 'active') === 'active'): ?>
+                                <form method="post" style="display:contents;"
+                                      onsubmit="return confirm('Suspend account of <?= htmlspecialchars(addslashes($u['name'])) ?>? They will not be able to log in.')">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="action" value="suspend_user">
+                                    <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
+                                    <button type="submit" class="tbl-action ta-delete" title="Suspend Account" style="background:var(--yellow-lt);color:var(--yellow);">
+                                        <i data-lucide="ban" style="width:11px;height:11px"></i> Suspend
+                                    </button>
+                                </form>
+                                <?php else: ?>
+                                <form method="post" style="display:contents;"
+                                      onsubmit="return confirm('Reactivate account of <?= htmlspecialchars(addslashes($u['name'])) ?>?')">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="action" value="activate_user">
+                                    <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
+                                    <button type="submit" class="tbl-action ta-approve" title="Activate Account">
+                                        <i data-lucide="check-circle" style="width:11px;height:11px"></i> Activate
+                                    </button>
+                                </form>
+                                <?php endif; ?>
+                                <?php endif; ?>
+                                <?php if (!$is_me && $u['role'] !== 'super_admin'): ?>
+                                <form method="post" style="display:contents;"
+                                      onsubmit="return confirm('<?= $is_sa ? 'Delete' : 'Request deletion of' ?> <?= htmlspecialchars(addslashes($u['name'])) ?>?<?= $is_sa ? ' This cannot be undone.' : ' This will require Super Admin approval.' ?>')">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="action" value="delete_user">
+                                    <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
+                                    <button type="submit" class="tbl-action ta-delete" title="<?= $is_sa ? 'Delete' : 'Request deletion' ?>">
+                                        <i data-lucide="<?= $is_sa ? 'trash-2' : 'clock' ?>" style="width:11px;height:11px"></i>
+                                    </button>
+                                </form>
+                                <?php endif; ?>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+</main>
+
+<script src="partials/admin.js"></script>
+<script>
+setTimeout(() => {
+    const t = document.querySelector('.toast');
+    if (t) t.style.display = 'none';
+}, 4000);
+</script>
 </body>
 </html>

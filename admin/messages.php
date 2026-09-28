@@ -3,201 +3,282 @@
 require_once __DIR__ . '/../helpers.php';
 require_admin();
 
-// --- Message Data Query (Placeholder) ---
-$messages = [
-    ['id' => 301, 'sender' => 'jason.b@email.com', 'subject' => 'Follow up on my medical aid', 'created_at' => '2025-10-06 10:00:00', 'is_read' => false],
-    ['id' => 302, 'sender' => 'maria.d@email.com', 'subject' => 'Thank You for the approval!', 'created_at' => '2025-10-05 15:30:00', 'is_read' => true],
-    ['id' => 303, 'sender' => 'anna.g@email.com', 'subject' => 'Appeal for rejected livelihood aid', 'created_at' => '2025-10-04 09:15:00', 'is_read' => false],
-];
+$toast = '';
+
+// --- Handle Reply POST ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'reply') {
+    $reply_to   = (int)($_POST['user_id'] ?? 0);
+    $reply_msg  = trim($_POST['message'] ?? '');
+    $admin_id   = $_SESSION['user']['id'] ?? 0;
+
+    if ($reply_to && $reply_msg) {
+        $stmt = $mysqli->prepare("INSERT INTO messages (user_id, sender, message, admin_id, is_read) VALUES (?, 'admin', ?, ?, 0)");
+        $stmt->bind_param('isi', $reply_to, $reply_msg, $admin_id);
+        $stmt->execute();
+        $stmt->close();
+        header('Location: messages.php?toast=sent'); exit;
+    }
+}
+
+// --- Handle Delete POST ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete') {
+    $del_id = (int)($_POST['id'] ?? 0);
+    if ($del_id) {
+        $stmt = $mysqli->prepare("DELETE FROM messages WHERE id=?");
+        $stmt->bind_param('i', $del_id);
+        $stmt->execute();
+        $stmt->close();
+        header('Location: messages.php?toast=deleted'); exit;
+    }
+}
+
+// --- Mark as read ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'mark_read') {
+    $mr_id = (int)($_POST['id'] ?? 0);
+    if ($mr_id) {
+        $stmt = $mysqli->prepare("UPDATE messages SET is_read=1 WHERE id=?");
+        $stmt->bind_param('i', $mr_id);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+// -----------------------------
+// Fetch messages safely
+// -----------------------------
+$messages = [];
+$stmt = $mysqli->prepare("
+    SELECT m.id, m.user_id, m.sender, m.message, m.created_at, m.is_read, u.name AS sender_name,
+           COALESCE(a.name, 'Admin') AS admin_name
+    FROM messages m
+    LEFT JOIN users u ON m.user_id = u.id
+    LEFT JOIN users a ON m.admin_id = a.id
+    ORDER BY m.created_at DESC
+");
+
+if ($stmt) {
+    $stmt->execute();
+    $messages = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+}
+
+// Count unread messages safely
+$unread_count = count(array_filter($messages, function($m) { return empty($m['is_read']); }));
+
+// -----------------------------
+// Pending aids count (safe query)
+// -----------------------------
+$pending_aids = 0;
+$res = $mysqli->query("SELECT COUNT(*) AS total FROM applications WHERE status='pending'");
+if ($res) {
+    $row = $res->fetch_assoc();
+    $pending_aids = (int)($row['total'] ?? 0);
+}
+
+// Page config
+$active_page   = 'messages';
+$page_title    = 'Messages';
+$page_subtitle = 'Messages';
+$colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Messages | Admin Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-/* --- Admin Dashboard CSS (Self-Contained) --- */
-
-/* Global Reset & Font */
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { 
-    font-family: 'Poppins', sans-serif; 
-    background: #f4f6fc; /* Very light background */
-    color: #333; 
-}
-a { text-decoration: none; }
-
-/* App Layout */
-.app { display: flex; min-height: 100vh; }
-
-/* Sidebar - Using colors from the MONITOR PANEL image */
-.sidebar {
-    width: 240px;
-    background-color: #FFA500; /* Orange color from the image */
-    color: #fff;
-    display: flex;
-    flex-direction: column;
-    min-height: 100vh;
-    box-shadow: 2px 0 5px rgba(0,0,0,0.1);
-}
-.sidebar-logo {
-    font-size: 1.8rem;
-    text-align: center;
-    margin: 1.5rem 0;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #fff;
-}
-.sidebar-nav a {
-    display: flex;
-    align-items: center;
-    padding: 0.9rem 1.5rem;
-    color: #333; /* Dark text for better contrast on orange */
-    border-radius: 6px;
-    margin: 0.3rem 1rem;
-    transition: 0.2s;
-    background-color: #FFC04C; /* Lighter orange for normal state */
-    font-weight: 500;
-}
-.sidebar-nav a.active,
-.sidebar-nav a:hover { 
-    background-color: #fff; /* White background on active/hover */
-    color: #FFA500; /* Orange text on active/hover */
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
-
-/* Main content */
-.main { flex: 1; display: flex; flex-direction: column; }
-.header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 1.2rem 2rem;
-    background-color: #fff;
-    border-bottom: 1px solid #e0e0e0;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
-}
-.header h1 { font-size: 1.5rem; font-weight: 600; }
-.btn-logout {
-    background-color: #DC3545; /* Red color for logout */
-    color: #fff;
-    padding: 0.5rem 1.2rem;
-    border: none;
-    border-radius: 6px;
-    font-weight: 500;
-    transition: 0.2s;
-}
-.btn-logout:hover { background-color: #c82333; }
-
-/* Main Content Area */
-.content { padding: 1.5rem 2rem; }
-
-/* Card styles */
-.card {
-    background: #fff;
-    padding: 1.2rem 1.5rem;
-    border-radius: 10px;
-    box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
-}
-.section-card .card-title { 
-    font-weight: 600; 
-    font-size: 1.2rem; 
-    margin-bottom: 1rem; 
-    border-bottom: 1px solid #eee;
-    padding-bottom: 0.5rem;
-}
-.card-body { 
-    max-height: 70vh; 
-    overflow-y: auto; 
-}
-
-/* Data Table */
-.data-table-container { overflow-x: auto; }
-.data-table-container table { width: 100%; border-collapse: collapse; min-width: 700px; } /* Adjusted min-width */
-.data-table-container th, .data-table-container td { padding: 0.9rem 1rem; border-bottom: 1px solid #eee; text-align: left; font-size: 0.9rem; }
-.data-table-container th { background: #f8f8f8; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; color: #666; }
-.data-table-container tr:hover { background: #f0f8ff; }
-
-/* Custom Status color coding for Messages */
-td.status-false { color: #DC3545; font-weight: 700; } /* Unread */
-td.status-true { color: #28A745; font-weight: 500; } /* Read */
-
-/* Generic Status color coding (kept from Aid History) */
-td.status-pending { color: #FFA500; font-weight: 600; } 
-td.status-approved { color: #28A745; font-weight: 600; } 
-td.status-rejected { color: #DC3545; font-weight: 600; } 
-
-/* Responsive adjustments */
-@media (max-width: 1024px) {
-    .data-section-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 768px) {
-    .sidebar { width: 100%; height: auto; min-height: unset; border-right: none; }
-    .app { flex-direction: column; }
-    .sidebar-nav { display: flex; flex-wrap: wrap; justify-content: space-around; margin: 0 0 1rem 0; }
-    .sidebar-nav a { margin: 0.2rem; padding: 0.5rem 1rem; flex-grow: 1; justify-content: center;}
-    .sidebar-logo { display: none; }
-    .content { padding: 1rem; }
-}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Messages — AIDTRACK Admin</title>
+<link rel="icon" type="image/x-icon" href="../assets/images/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="partials/admin.css">
+<script src="https://unpkg.com/lucide@latest"></script>
+<style>
+/* Messages-specific styles omitted for brevity (use your existing CSS) */
+</style>
 </head>
 <body>
-<div class="app">
-    <aside class="sidebar">
-        <div class="sidebar-logo">AidTrack</div>
-        <nav class="sidebar-nav">
-            <a href="dashboard.php">Dashboard</a>
-            <a href="user.php">Users</a>
-            <a href="applications.php">Applications</a>
-            <a href="messages.php" class="active">Messages</a> <a href="aid_history.php">Aid History</a> 
-            <a href="beneficiaries.php">Beneficiaries</a>
-        </nav>
-    </aside>
 
-    <div class="main">
-        <header class="header">
-            <h1>Messages Inbox</h1>
-            <a class="btn-logout" href="../logout.php">Logout</a>
-        </header>
+<?php include 'partials/sidebar.php'; ?>
+<?php include 'partials/topbar.php'; ?>
 
-        <main class="content">
+<?php if (!empty($_GET['toast'])): ?>
+<div class="toast toast-success" style="position:fixed;bottom:24px;right:24px;z-index:999;display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:10px;font-size:.83rem;font-weight:600;box-shadow:0 8px 28px rgba(0,0,0,.15);background:var(--green-lt,#f0fdf4);color:var(--green,#16a34a);border:1px solid rgba(22,163,74,.2);animation:toastIn .3s ease,toastOut .4s ease 3s forwards;">
+    <i data-lucide="check-circle" style="width:16px;height:16px"></i>
+    <?= $_GET['toast'] === 'sent' ? 'Reply sent successfully.' : 'Message deleted.' ?>
+</div>
+<style>@keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}@keyframes toastOut{from{opacity:1}to{opacity:0;pointer-events:none}}</style>
+<?php endif; ?>
 
-            <div class="card section-card">
-                <div class="card-title">Messages (<?= count($messages) ?> Total)</div>
-                <div class="card-body">
-                    <div class="data-table-container">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Status</th>
-                                    <th>Sender</th>
-                                    <th>Subject</th>
-                                    <th>Date</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php foreach($messages as $msg): ?>
-                                    <tr>
-                                        <td class="status-<?= $msg['is_read'] ? 'true' : 'false' ?>"><?= $msg['is_read'] ? 'Read' : 'Unread' ?></td>
-                                        <td><?= htmlspecialchars($msg['sender']) ?></td>
-                                        <td><?= htmlspecialchars($msg['subject']) ?></td>
-                                        <td><?= htmlspecialchars(date('M d, Y H:i', strtotime($msg['created_at']))) ?></td>
-                                        <td>
-                                            <a href="message_view.php?id=<?= $msg['id'] ?>">View</a> | 
-                                            <a href="message_delete.php?id=<?= $msg['id'] ?>" onclick="return confirm('Delete this message?')">Delete</a>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+<main class="main">
+<div class="page-header">
+    <div class="page-header-top">
+        <div>
+            <div class="page-title">
+                Messages Inbox
+                <?php if ($unread_count > 0): ?>
+                <span class="unread-pill"><?= $unread_count ?> unread</span>
+                <?php endif; ?>
             </div>
-        </main>
+            <div class="page-sub">Manage incoming messages from beneficiaries and applicants.</div>
+        </div>
+        <div class="page-actions">
+            <div class="inbox-tabs">
+                <button class="itab active" onclick="filterMsgs('all',this)">All</button>
+                <button class="itab" onclick="filterMsgs('unread',this)">Unread</button>
+                <button class="itab" onclick="filterMsgs('read',this)">Read</button>
+            </div>
+            <span class="count-pill"><?= count($messages) ?> total</span>
+        </div>
     </div>
 </div>
+
+<div class="inbox-layout">
+    <!-- Message List -->
+    <div class="card msg-panel">
+        <div class="msg-panel-filter">
+            <i data-lucide="search" style="width:14px;height:14px;color:var(--muted);flex-shrink:0;"></i>
+            <input type="text" id="msgSearch" placeholder="Search messages…" oninput="searchMsgs(this.value)">
+        </div>
+        <div class="msg-list" id="msgList">
+            <?php if (empty($messages)): ?>
+                <div class="empty-state">
+                    <div class="empty-icon"><i data-lucide="inbox" style="width:20px;height:20px"></i></div>
+                    <div class="empty-text">No messages found.</div>
+                </div>
+            <?php else:
+                foreach ($messages as $i => $msg):
+                    $col   = $colors[$i % count($colors)];
+                    $name  = $msg['sender_name'] ?? ucfirst($msg['sender']);
+                    $init  = implode('', array_map(fn($w) => strtoupper($w[0]), array_slice(explode(' ', $name), 0, 2)));
+                    $preview = mb_substr($msg['message'] ?? '', 0, 60);
+                    $unread= empty($msg['is_read']);
+            ?>
+            <div class="msg-row <?= $unread ? 'unread' : '' ?>"
+                 data-read="<?= $unread ? 'unread' : 'read' ?>"
+                 data-id="<?= (int)$msg['id'] ?>"
+                 onclick='selectMsg(
+                     this,
+                     <?= (int)$msg["id"] ?>,
+                     <?= json_encode($name) ?>,
+                     <?= json_encode(date("M d, Y H:i", strtotime($msg["created_at"]))) ?>,
+                     <?= json_encode($msg["message"] ?? "No message content.") ?>,
+                     <?= json_encode($col) ?>,
+                     <?= json_encode($init) ?>,
+                     <?= (int)($msg["user_id"] ?? 0) ?>,
+                     <?= json_encode($msg["sender"] ?? "client") ?>
+                 )'>
+                <div class="msg-av" style="background:<?= $col ?>"><?= $init ?></div>
+                <div class="msg-row-body">
+                    <div class="msg-row-top">
+                        <span class="msg-row-sender"><?= htmlspecialchars($name) ?></span>
+                        <span class="msg-row-time"><?= date('M d', strtotime($msg['created_at'])) ?></span>
+                    </div>
+                    <div class="msg-row-subject"><?= htmlspecialchars($preview ?: '(No content)') ?></div>
+                </div>
+                <?php if ($unread): ?><div class="unread-dot"></div><?php endif; ?>
+            </div>
+            <?php endforeach; endif; ?>
+        </div>
+    </div>
+
+    <!-- Message Viewer -->
+    <div class="card msg-viewer" id="msgViewer">
+        <div class="mv-empty" id="mvEmpty">
+            <div class="mv-empty-icon"><i data-lucide="mail-open" style="width:24px;height:24px"></i></div>
+            <div class="mv-empty-text">Select a message to read it</div>
+        </div>
+        <div id="mvContent" style="display:none;">
+            <div class="mv-header">
+                <div class="mv-subject" id="mvSubject"></div>
+                <div class="mv-meta">
+                    <div class="mv-av" id="mvAv"></div>
+                    <div>
+                        <div class="mv-sender-name" id="mvSenderName"></div>
+                        <div class="mv-sender-email" id="mvSenderEmail"></div>
+                    </div>
+                    <div class="mv-date" id="mvDate"></div>
+                </div>
+            </div>
+            <div class="mv-body" id="mvBody"></div>
+
+            <!-- Reply Form -->
+            <div id="mvReplySection" style="border-top:1px solid var(--border);padding:16px 20px;margin-top:12px;">
+                <div style="font-size:.76rem;font-weight:700;color:var(--slate);margin-bottom:8px;">
+                    <i data-lucide="reply" style="width:12px;height:12px;vertical-align:middle"></i> Reply
+                </div>
+                <form method="post">
+                    <input type="hidden" name="action" value="reply">
+                    <input type="hidden" name="user_id" id="mvReplyUserId">
+                    <textarea name="message" placeholder="Type your reply…" required
+                        style="width:100%;min-height:80px;font-family:inherit;font-size:.84rem;color:var(--navy);background:var(--bg);border:1.5px solid var(--border);border-radius:8px;padding:10px 14px;outline:none;resize:vertical;margin-bottom:8px;"></textarea>
+                    <div style="display:flex;gap:8px;justify-content:flex-end;">
+                        <form method="post" style="display:inline;" id="mvDeleteForm">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="id" id="mvDeleteId">
+                            <button type="submit" class="btn btn-outline btn-sm" style="color:var(--red);border-color:rgba(220,38,38,.15);"
+                                    onclick="return confirm('Delete this message?')">
+                                <i data-lucide="trash-2" style="width:13px;height:13px"></i> Delete
+                            </button>
+                        </form>
+                        <button type="submit" class="btn btn-primary btn-sm">
+                            <i data-lucide="send" style="width:13px;height:13px"></i> Send Reply
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+</main>
+
+<script src="partials/admin.js"></script>
+<script>
+function selectMsg(el, id, sender, date, body, color, initials, userId, senderType) {
+    document.querySelectorAll('.msg-row').forEach(r => r.classList.remove('selected'));
+    el.classList.add('selected');
+    const dot = el.querySelector('.unread-dot');
+    if(dot) dot.remove();
+    el.classList.remove('unread');
+    el.dataset.read = 'read';
+
+    document.getElementById('mvEmpty').style.display   = 'none';
+    document.getElementById('mvContent').style.display = 'block';
+    document.getElementById('mvSubject').textContent    = (senderType === 'admin' ? 'Reply to ' : 'Message from ') + sender;
+    document.getElementById('mvSenderName').textContent = sender;
+    document.getElementById('mvSenderEmail').textContent= senderType === 'admin' ? 'Admin Reply' : 'Client Message';
+    document.getElementById('mvDate').textContent       = date;
+    document.getElementById('mvBody').textContent       = body || 'No message content.';
+    document.getElementById('mvReplyUserId').value      = userId;
+    document.getElementById('mvDeleteId').value         = id;
+    const av = document.getElementById('mvAv');
+    av.textContent = initials;
+    av.style.background = color;
+
+    // Show/hide reply section based on sender
+    document.getElementById('mvReplySection').style.display = userId > 0 ? 'block' : 'none';
+
+    // Mark as read via AJAX
+    fetch('messages.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `action=mark_read&id=${id}`
+    });
+}
+
+function filterMsgs(filter, btn) {
+    document.querySelectorAll('.itab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.msg-row').forEach(row => {
+        row.style.display = (filter==='all' || row.dataset.read===filter) ? '' : 'none';
+    });
+}
+
+function searchMsgs(val) {
+    const q = val.toLowerCase();
+    document.querySelectorAll('.msg-row').forEach(row => {
+        row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+}
+</script>
 </body>
 </html>
