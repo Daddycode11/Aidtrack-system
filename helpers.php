@@ -164,7 +164,8 @@ function csrf_token(): string {
 
 function csrf_verify(): bool {
     $token = $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
-    return hash_equals($_SESSION['csrf_token'] ?? '', $token);
+    $expected = $_SESSION['csrf_token'] ?? '';
+    return is_string($token) && is_string($expected) && $expected !== '' && hash_equals($expected, $token);
 }
 
 function csrf_field(): string {

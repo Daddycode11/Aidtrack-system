@@ -70,3 +70,49 @@ function send_verification_email(mysqli $mysqli, int $userId, string $email, str
         return false;
     }
 }
+
+function send_admin_login_code(string $email, string $name, string $code): bool
+{
+    if (!defined('MAIL_USER') || !defined('MAIL_APP_PASS')
+        || MAIL_USER === '' || MAIL_APP_PASS === '') {
+        error_log('Admin login email is not configured.');
+        return false;
+    }
+
+    try {
+        $autoload = __DIR__ . '/../vendor/autoload.php';
+        if (!is_file($autoload)) {
+            throw new RuntimeException('Composer dependencies are not installed.');
+        }
+        require_once $autoload;
+        if (!class_exists(\PHPMailer\PHPMailer\PHPMailer::class)) {
+            throw new RuntimeException('PHPMailer is not installed.');
+        }
+
+        $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';
+        $mail->SMTPAuth = true;
+        $mail->Username = MAIL_USER;
+        $mail->Password = MAIL_APP_PASS;
+        $mail->SMTPSecure = \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port = 587;
+        $mail->CharSet = 'UTF-8';
+        $mail->setFrom(MAIL_USER, 'AIDTRACK');
+        $mail->addAddress($email, $name);
+        $mail->isHTML(true);
+        $safeName = htmlspecialchars($name, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeCode = htmlspecialchars($code, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $mail->Subject = 'Your AIDTRACK sign-in code';
+        $mail->Body = '<p>Hello ' . $safeName . ',</p>'
+            . '<p>Your AIDTRACK admin sign-in code is:</p>'
+            . '<p style="font-size:24px;font-weight:bold;letter-spacing:4px">' . $safeCode . '</p>'
+            . '<p>This code expires in 10 minutes. Do not share it with anyone.</p>';
+        $mail->AltBody = "Hello {$name},\n\nYour AIDTRACK admin sign-in code is {$code}. It expires in 10 minutes. Do not share it with anyone.";
+        $mail->send();
+        return true;
+    } catch (Throwable $e) {
+        error_log('Could not send AIDTRACK admin login code: ' . $e->getMessage());
+        return false;
+    }
+}

@@ -1,61 +1,183 @@
 <?php
 require_once 'helpers.php';
+require_once __DIR__ . '/helpers/mailer.php';
 
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
 $errors = [];
+$notice = '';
+
+function begin_admin_login_code(array $user): bool
+{
+    $code = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+    if (!send_admin_login_code($user['email'], $user['name'], $code)) {
+        return false;
+    }
+    $_SESSION['admin_login_otp'] = [
+        'user_id' => (int)$user['id'],
+        'email_hash' => hash('sha256', strtolower($user['email'])),
+        'code_hash' => password_hash($code, PASSWORD_DEFAULT),
+        'expires_at' => time() + 600,
+        'sent_at' => time(),
+        'attempts' => 0,
+    ];
+    return true;
+}
+
+function finish_admin_login(mysqli $mysqli, int $userId, string $expectedEmailHash): bool
+{
+    $stmt = $mysqli->prepare("SELECT id, phone, email, name, role, email_verified
+        FROM users WHERE id = ? AND role IN ('admin', 'super_admin') LIMIT 1");
+    if (!$stmt) {
+        return false;
+    }
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $user = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$user || (int)$user['email_verified'] !== 1 || !filter_var($user['email'], FILTER_VALIDATE_EMAIL)
+        || !hash_equals($expectedEmailHash, hash('sha256', strtolower($user['email'])))) {
+        return false;
+    }
+
+    session_regenerate_id(true);
+    unset($_SESSION['admin_login_otp']);
+    $_SESSION['user'] = $user;
+    header('Location: admin/dashboard.php');
+    exit;
+}
+
+function mask_login_email(string $email): string
+{
+    [$local, $domain] = array_pad(explode('@', $email, 2), 2, '');
+    return ($local !== '' ? substr($local, 0, 1) . str_repeat('*', max(2, strlen($local) - 1)) : '***') . '@' . $domain;
+}
+
+if (($_GET['cancel_otp'] ?? '') === '1') {
+    unset($_SESSION['admin_login_otp']);
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $identifier = trim($_POST['identifier'] ?? '');
-    $password = $_POST['password'] ?? '';
-
-    if (!$identifier || !$password) {
-        $errors[] = 'Email or phone number and password are required.';
-    } else {
-        $mysqli->select_db(DB_NAME);
-
-        $is_email = filter_var($identifier, FILTER_VALIDATE_EMAIL) !== false;
-        $sql = $is_email
-            ? "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE email = ? AND role IN ('admin', 'super_admin') LIMIT 1"
-            : "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE phone = ? AND role = 'client' LIMIT 1";
-        $stmt = $mysqli->prepare($sql);
-
-        if ($stmt) {
-            $stmt->bind_param('s', $identifier);
-            $stmt->execute();
-
-            $res = $stmt->get_result();
-            $u   = $res->fetch_assoc();
-
-            $stmt->close();
-
-            if (!$u || !password_verify($password, $u['password_hash'])) {
-                $errors[] = 'Invalid email or phone number and password. Please try again.';
-            } elseif (in_array($u['role'], ['admin', 'super_admin'], true) && (int)$u['email_verified'] !== 1) {
-                $errors[] = 'Please verify your Gmail address using the verification link sent to your inbox. You can request a new link below.';
+    $action = $_POST['action'] ?? 'login';
+    if (in_array($action, ['verify_admin_code', 'resend_admin_code', 'cancel_admin_code'], true)) {
+        if (!csrf_verify()) {
+            $errors[] = 'Security check failed. Refresh the page and try again.';
+        } elseif ($action === 'cancel_admin_code') {
+            unset($_SESSION['admin_login_otp']);
+        } elseif (empty($_SESSION['admin_login_otp'])) {
+            $errors[] = 'Your sign-in code session has expired. Sign in again.';
+        } else {
+            $pendingOtp = &$_SESSION['admin_login_otp'];
+            if (time() >= (int)$pendingOtp['expires_at']) {
+                unset($_SESSION['admin_login_otp']);
+                $errors[] = 'Your sign-in code has expired. Sign in again to request another.';
+            } elseif ($action === 'resend_admin_code') {
+                if (time() - (int)$pendingOtp['sent_at'] < 60) {
+                    $errors[] = 'Please wait before requesting another code.';
+                } else {
+                    $lookup = $mysqli->prepare("SELECT email, name FROM users WHERE id = ? AND role IN ('admin', 'super_admin') AND email_verified = 1 LIMIT 1");
+                    $lookup->bind_param('i', $pendingOtp['user_id']);
+                    $lookup->execute();
+                    $account = $lookup->get_result()->fetch_assoc();
+                    $lookup->close();
+                    if (!$account) {
+                        unset($_SESSION['admin_login_otp']);
+                        $errors[] = 'Your sign-in session is no longer valid. Sign in again.';
+                    } else {
+                        $code = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+                        if (send_admin_login_code($account['email'], $account['name'], $code)) {
+                            $pendingOtp['code_hash'] = password_hash($code, PASSWORD_DEFAULT);
+                            $pendingOtp['email_hash'] = hash('sha256', strtolower($account['email']));
+                            $pendingOtp['expires_at'] = time() + 600;
+                            $pendingOtp['sent_at'] = time();
+                            $pendingOtp['attempts'] = 0;
+                            $notice = 'A new sign-in code was sent to ' . mask_login_email($account['email']) . '.';
+                        } else {
+                            $errors[] = 'Could not send a sign-in code. Check mail settings and try again.';
+                        }
+                    }
+                }
             } else {
-
-                unset($u['password_hash']);
-                session_regenerate_id(true);
-                $_SESSION['user'] = $u;
-
-                switch ($u['role']) {
-                    case 'super_admin':
-                    case 'admin':
-                        header('Location: admin/dashboard.php');
-                        exit;
-
-                    case 'client':
-                    default:
-                        header('Location: client/dashboard.php');
-                        exit;
+                $code = trim((string)($_POST['verification_code'] ?? ''));
+                if (!preg_match('/\A\d{6}\z/', $code) || !password_verify($code, $pendingOtp['code_hash'])) {
+                    $pendingOtp['attempts']++;
+                    if ($pendingOtp['attempts'] >= 5) {
+                        unset($_SESSION['admin_login_otp']);
+                        $errors[] = 'Too many incorrect codes. Sign in again to request a new code.';
+                    } else {
+                        $errors[] = 'That sign-in code is incorrect.';
+                    }
+                } else {
+                    $userId = (int)$pendingOtp['user_id'];
+                    $emailHash = (string)($pendingOtp['email_hash'] ?? '');
+                    if (!finish_admin_login($mysqli, $userId, $emailHash)) {
+                        unset($_SESSION['admin_login_otp']);
+                        $errors[] = 'Your admin account could not be verified. Sign in again.';
+                    }
                 }
             }
-        } else {
-            $errors[] = 'A system error occurred. Please try again.';
+            unset($pendingOtp);
         }
+    } else {
+        $identifier = trim($_POST['identifier'] ?? '');
+        $password = $_POST['password'] ?? '';
+
+        if (!$identifier || !$password) {
+            $errors[] = 'Email or phone number and password are required.';
+        } else {
+            $mysqli->select_db(DB_NAME);
+
+            $is_email = filter_var($identifier, FILTER_VALIDATE_EMAIL) !== false;
+            $sql = $is_email
+                ? "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE email = ? AND role IN ('admin', 'super_admin') LIMIT 1"
+                : "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE phone = ? AND role = 'client' LIMIT 1";
+            $stmt = $mysqli->prepare($sql);
+
+            if ($stmt) {
+                $stmt->bind_param('s', $identifier);
+                $stmt->execute();
+                $u = $stmt->get_result()->fetch_assoc();
+                $stmt->close();
+
+                if (!$u || !password_verify($password, $u['password_hash'])) {
+                    $errors[] = 'Invalid email or phone number and password. Please try again.';
+                } elseif (in_array($u['role'], ['admin', 'super_admin'], true) && (int)$u['email_verified'] !== 1) {
+                    $errors[] = 'Please verify your Gmail address using the verification link sent to your inbox. You can request a new link below.';
+                } elseif (in_array($u['role'], ['admin', 'super_admin'], true)) {
+                    if (begin_admin_login_code($u)) {
+                        $notice = 'A sign-in code was sent to ' . mask_login_email($u['email']) . '. It expires in 10 minutes.';
+                    } else {
+                        $errors[] = 'Could not send a sign-in code. Check mail settings and try again.';
+                    }
+                } else {
+                    unset($u['password_hash']);
+                    session_regenerate_id(true);
+                    $_SESSION['user'] = $u;
+                    header('Location: client/dashboard.php');
+                    exit;
+                }
+            } else {
+                $errors[] = 'A system error occurred. Please try again.';
+            }
+        }
+    }
+}
+$otpPending = !empty($_SESSION['admin_login_otp']);
+$otpEmail = '';
+if ($otpPending) {
+    $otpLookup = $mysqli->prepare("SELECT email FROM users WHERE id = ? AND role IN ('admin', 'super_admin') LIMIT 1");
+    if ($otpLookup) {
+        $otpLookup->bind_param('i', $_SESSION['admin_login_otp']['user_id']);
+        $otpLookup->execute();
+        $otpEmail = (string)($otpLookup->get_result()->fetch_assoc()['email'] ?? '');
+        $otpLookup->close();
+    }
+    if ($otpEmail === '') {
+        unset($_SESSION['admin_login_otp']);
+        $otpPending = false;
     }
 }
 ?>
@@ -428,8 +550,20 @@ body {
             </div>
         </div>
 
+        <?php if ($otpPending): ?>
+        <h2 class="form-heading">Check your Gmail</h2>
+        <p class="form-subheading">Enter the six-digit sign-in code sent to <?= htmlspecialchars(mask_login_email($otpEmail), ENT_QUOTES, 'UTF-8') ?>.</p>
+        <?php else: ?>
         <h2 class="form-heading">Sign in to your account</h2>
         <p class="form-subheading">Enter your registered email or phone number and password to continue.</p>
+        <?php endif; ?>
+
+        <?php if ($notice): ?>
+        <div class="alert" style="background:var(--brand-lt);border:1px solid rgba(26,86,219,.18);color:var(--brand);">
+            <i data-lucide="mail-check" style="width:16px;height:16px;flex-shrink:0"></i>
+            <span><?= htmlspecialchars($notice, ENT_QUOTES, 'UTF-8') ?></span>
+        </div>
+        <?php endif; ?>
 
         <!-- Error alerts -->
         <?php if ($errors): foreach ($errors as $e): ?>
@@ -439,6 +573,37 @@ body {
         </div>
         <?php endforeach; endif; ?>
 
+        <?php if ($otpPending): ?>
+        <form method="post" id="otpForm">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="verify_admin_code">
+            <div class="field-group">
+                <div class="field">
+                    <label for="verification_code">Email verification code</label>
+                    <div class="input-wrap">
+                        <i data-lucide="key-round" class="input-icon" style="width:16px;height:16px"></i>
+                        <input type="text" id="verification_code" name="verification_code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code" required autofocus>
+                    </div>
+                </div>
+            </div>
+            <button type="submit" class="btn-submit">
+                <span>Verify and Sign In</span>
+                <i data-lucide="arrow-right" style="width:16px;height:16px"></i>
+            </button>
+        </form>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:2px;">
+            <form method="post">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="resend_admin_code">
+                <button type="submit" class="forgot-link" style="background:none;border:0;font-family:inherit;cursor:pointer;padding:0;">Resend code</button>
+            </form>
+            <form method="post">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="cancel_admin_code">
+                <button type="submit" class="forgot-link" style="background:none;border:0;font-family:inherit;cursor:pointer;padding:0;">Use another account</button>
+            </form>
+        </div>
+        <?php else: ?>
         <form method="post" id="loginForm" onsubmit="handleSubmit(event)">
 
             <div class="field-group">
@@ -494,7 +659,9 @@ body {
             </button>
 
         </form>
+        <?php endif; ?>
 
+        <?php if (!$otpPending): ?>
         <div class="divider">
             <div class="divider-line"></div>
             <span class="divider-text">Don't have an account?</span>
@@ -508,6 +675,7 @@ body {
                 <i data-lucide="arrow-right" style="width:14px;height:14px"></i>
             </a>
         </div>
+        <?php endif; ?>
 
     </div>
 
