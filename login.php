@@ -8,21 +8,22 @@ if (session_status() === PHP_SESSION_NONE) {
 $errors = [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $phone    = trim($_POST['phone'] ?? '');
+    $identifier = trim($_POST['identifier'] ?? '');
     $password = $_POST['password'] ?? '';
 
-    if (!$phone || !$password) {
-        $errors[] = 'Phone number and password are required.';
+    if (!$identifier || !$password) {
+        $errors[] = 'Email or phone number and password are required.';
     } else {
         $mysqli->select_db(DB_NAME);
 
-        $stmt = $mysqli->prepare("
-            SELECT id, phone, name, password_hash, role
-            FROM users WHERE phone = ? LIMIT 1
-        ");
+        $is_email = filter_var($identifier, FILTER_VALIDATE_EMAIL) !== false;
+        $sql = $is_email
+            ? "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE email = ? AND role IN ('admin', 'super_admin') LIMIT 1"
+            : "SELECT id, phone, email, name, password_hash, role, email_verified FROM users WHERE phone = ? AND role = 'client' LIMIT 1";
+        $stmt = $mysqli->prepare($sql);
 
         if ($stmt) {
-            $stmt->bind_param('s', $phone);
+            $stmt->bind_param('s', $identifier);
             $stmt->execute();
 
             $res = $stmt->get_result();
@@ -31,10 +32,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->close();
 
             if (!$u || !password_verify($password, $u['password_hash'])) {
-                $errors[] = 'Invalid phone number or password. Please try again.';
+                $errors[] = 'Invalid email or phone number and password. Please try again.';
+            } elseif (in_array($u['role'], ['admin', 'super_admin'], true) && (int)$u['email_verified'] !== 1) {
+                $errors[] = 'Please verify your Gmail address using the verification link sent to your inbox. You can request a new link below.';
             } else {
 
                 unset($u['password_hash']);
+                session_regenerate_id(true);
                 $_SESSION['user'] = $u;
 
                 switch ($u['role']) {
@@ -425,7 +429,7 @@ body {
         </div>
 
         <h2 class="form-heading">Sign in to your account</h2>
-        <p class="form-subheading">Enter your registered phone number and password to continue.</p>
+        <p class="form-subheading">Enter your registered email or phone number and password to continue.</p>
 
         <!-- Error alerts -->
         <?php if ($errors): foreach ($errors as $e): ?>
@@ -439,15 +443,15 @@ body {
 
             <div class="field-group">
                 <div class="field">
-                    <label for="phone">Phone Number</label>
+                    <label for="identifier">Email or Phone Number</label>
                     <div class="input-wrap">
-                        <i data-lucide="smartphone" class="input-icon" style="width:16px;height:16px"></i>
+                        <i data-lucide="at-sign" class="input-icon" style="width:16px;height:16px"></i>
                         <input
                             type="text"
-                            id="phone"
-                            name="phone"
-                            placeholder="e.g. 09171234567"
-                            value="<?= htmlspecialchars($_POST['phone'] ?? '') ?>"
+                            id="identifier"
+                            name="identifier"
+                            placeholder="Email address or phone number"
+                            value="<?= htmlspecialchars($_POST['identifier'] ?? '', ENT_QUOTES, 'UTF-8') ?>"
                             autocomplete="username"
                             class="<?= $errors ? 'error-field' : '' ?>"
                             required
@@ -480,6 +484,7 @@ body {
                     Remember me for 30 days
                 </label>
                 <a href="forgot_password.php" class="forgot-link">Forgot password?</a>
+                <a href="resend_verification.php" class="forgot-link">Resend verification</a>
             </div>
 
             <button type="submit" class="btn-submit" id="submitBtn">

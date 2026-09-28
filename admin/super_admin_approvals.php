@@ -2,6 +2,7 @@
 // admin/super_admin_approvals.php — Super Admin reviews and executes pending requests
 require_once __DIR__ . '/../helpers.php';
 require_once __DIR__ . '/../helpers/notify.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_super_admin();
 
 $sa_id = $_SESSION['user']['id'];
@@ -37,7 +38,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         SET status=?, reviewed_by=?, review_notes=?, reviewed_at=NOW()
         WHERE id=?
     ");
-    $stmt->bind_param('sisi', $decision === 'approve' ? 'approved' : 'rejected', $sa_id, $review_note, $req_id);
+    $decisionStatus = $decision === 'approve' ? 'approved' : 'rejected';
+    $stmt->bind_param('sisi', $decisionStatus, $sa_id, $review_note, $req_id);
     $stmt->execute();
     $stmt->close();
 
@@ -138,21 +140,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // ─────────────────────────────────────────────────────────────
 // Fetch pending requests
 // ─────────────────────────────────────────────────────────────
-$filter = $_GET['filter'] ?? 'pending';
-$where  = in_array($filter, ['pending','approved','rejected']) ? "WHERE ar.status = '$filter'" : '';
-
-$stmt = $mysqli->prepare("
-    SELECT ar.*, u.name AS requester_name, u.role AS requester_role,
-           sa.name AS reviewer_name
-    FROM approval_requests ar
-    LEFT JOIN users u  ON ar.requested_by = u.id
-    LEFT JOIN users sa ON ar.reviewed_by  = sa.id
-    $where
-    ORDER BY ar.created_at DESC
-");
-$stmt->execute();
-$requests = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$filter = $_GET['status'] ?? 'pending';
+$categoryOptions = ['medical'=>'Medical','burial'=>'Burial','educational'=>'Educational','livelihood'=>'Livelihood','emergency'=>'Emergency'];
+$requestTypeOptions = ['approve_application'=>'Approve Application','reject_application'=>'Reject Application','release_funds'=>'Release Funds','delete_user'=>'Delete User','update_budget'=>'Update Budget','suspend_account'=>'Suspend Account','bulk_approve'=>'Bulk Approve','record_modification'=>'Record Modification'];
+$barangayRows = $mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC);
+$barangayValues = array_column($barangayRows, 'barangay');
+$barangayOptions = array_combine($barangayValues, $barangayValues) ?: [];
+$table = table_filter_query($mysqli, [
+    'from_sql'=>"FROM approval_requests ar LEFT JOIN users u ON ar.requested_by=u.id LEFT JOIN users sa ON ar.reviewed_by=sa.id LEFT JOIN applications app ON app.id=COALESCE(CASE WHEN ar.request_type IN ('approve_application','reject_application','release_funds') THEN ar.reference_id END, CAST(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data,'$.app_id')) AS UNSIGNED)) LEFT JOIN users beneficiary ON beneficiary.id=app.user_id LEFT JOIN users target_user ON target_user.id=CAST(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data,'$.user_id')) AS UNSIGNED)",
+    'select_sql'=>'ar.*, u.name AS requester_name, u.role AS requester_role, u.phone AS requester_phone, u.email AS requester_email, sa.name AS reviewer_name, app.type AS app_type, beneficiary.name AS beneficiary_name, beneficiary.barangay',
+    'filters'=>[
+        'search'=>['kind'=>'search','label'=>'Keyword','placeholder'=>'Requester, ID or reason','columns'=>['u.name','u.phone','u.email','ar.reason','CAST(ar.id AS CHAR)','CAST(ar.reference_id AS CHAR)','beneficiary.name','target_user.name']],
+        'status'=>['kind'=>'select','label'=>'Status','options'=>['pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected','released'=>'Linked application released'],'sql'=>'ar.status','expressions'=>['released'=>'app.amount_released > 0']],
+        'type'=>['kind'=>'select','label'=>'Request type','options'=>$requestTypeOptions,'sql'=>'ar.request_type'],
+        'aid_type'=>['kind'=>'select','label'=>'Aid category','options'=>$categoryOptions,'sql'=>'COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, \'$.app_type\')), app.type)'],
+        'barangay'=>['kind'=>'select','label'=>'Barangay','options'=>$barangayOptions,'sql'=>'COALESCE(beneficiary.barangay,target_user.barangay)'],
+        'date_from'=>['kind'=>'date','label'=>'Submitted from','sql'=>'ar.created_at','operator'=>'>='],
+        'date_to'=>['kind'=>'date','label'=>'Submitted to','sql'=>'ar.created_at','operator'=>'<','inclusive_end'=>true],
+        'amount_min'=>['kind'=>'number','label'=>'Amount from','sql'=>"CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_granted')), JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_released'))) AS DECIMAL(12,2))",'operator'=>'>='],
+        'amount_max'=>['kind'=>'number','label'=>'Amount to','sql'=>"CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_granted')), JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_released'))) AS DECIMAL(12,2))",'operator'=>'<='],
+    ],
+    'sort'=>['id'=>'ar.id','requester'=>'u.name','type'=>'ar.request_type','status'=>'ar.status','submitted'=>'ar.created_at','reviewed'=>'ar.reviewed_at'],
+    'default_sort'=>'submitted','per_page'=>25,
+]);
+$requests = $table['rows'];
+$filter = $table['filters']['status'] ?: 'all';
 
 $pending_count  = get_pending_approvals_count($mysqli);
 $pending_aids   = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
@@ -263,22 +275,7 @@ $type_icons = [
         </div>
     </div>
 
-    <!-- Filter Tabs -->
-    <div class="filter-tabs">
-        <a href="?filter=pending"  class="ftab <?= $filter === 'pending'  ? 'active' : '' ?>">
-            <i data-lucide="clock" style="width:13px;height:13px;vertical-align:middle;margin-right:4px"></i>
-            Pending (<?= $pending_count ?>)
-        </a>
-        <a href="?filter=approved" class="ftab <?= $filter === 'approved' ? 'active' : '' ?>">
-            <i data-lucide="check-circle" style="width:13px;height:13px;vertical-align:middle;margin-right:4px"></i>
-            Approved
-        </a>
-        <a href="?filter=rejected" class="ftab <?= $filter === 'rejected' ? 'active' : '' ?>">
-            <i data-lucide="x-circle" style="width:13px;height:13px;vertical-align:middle;margin-right:4px"></i>
-            Rejected
-        </a>
-        <a href="?filter=all" class="ftab <?= $filter === 'all' ? 'active' : '' ?>">All</a>
-    </div>
+    <?php include 'partials/filter_bar.php'; ?>
 
     <?php if (empty($requests)): ?>
     <div class="card">
@@ -395,6 +392,7 @@ $type_icons = [
         <?php endif; ?>
     </div>
     <?php endforeach; ?>
+    <?php include 'partials/table_pager.php'; ?>
     <?php endif; ?>
 
 </main>

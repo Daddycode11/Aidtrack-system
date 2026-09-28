@@ -1,51 +1,47 @@
 <?php
 // admin/print_report.php — Printable report view
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
 
-$report_type = $_GET['type'] ?? 'applications';
-$f_status    = $_GET['status']      ?? '';
-$f_type      = $_GET['type_filter'] ?? ($_GET['type'] ?? '');
-$f_from      = $_GET['date_from']   ?? '';
-$f_to        = $_GET['date_to']     ?? '';
-$f_barangay  = $_GET['barangay']    ?? '';
-
-// Override: if type is a report type, don't use it as aid filter
-if (in_array($f_type, ['applications','beneficiaries','summary'])) $f_type = '';
+$report_type = $_GET['report'] ?? $_GET['type'] ?? 'applications';
+if (!in_array($report_type, ['applications','beneficiaries','summary'], true)) $report_type = 'applications';
+$_GET['type'] = $_GET['type_filter'] ?? '';
+$barangayRows = $mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC);
+$barangayValues = array_column($barangayRows, 'barangay');
+$barangayOptions = array_combine($barangayValues, $barangayValues) ?: [];
+$typeOptions = ['medical'=>'Medical','burial'=>'Burial','educational'=>'Educational','livelihood'=>'Livelihood','emergency'=>'Emergency'];
+$statusOptions = ['pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected','cancelled'=>'Cancelled','released'=>'Released'];
+$filters = [
+    'search'=>['kind'=>'search','label'=>'Keyword','columns'=>['u.name','u.phone','u.email','CAST(a.id AS CHAR)']],
+    'status'=>['kind'=>'select','label'=>'Status','options'=>$statusOptions,'sql'=>'a.status','expressions'=>['released'=>'a.amount_released > 0']],
+    'type'=>['kind'=>'select','label'=>'Aid type','options'=>$typeOptions,'sql'=>'a.type'],
+    'barangay'=>['kind'=>'select','label'=>'Barangay','options'=>$barangayOptions,'sql'=>'u.barangay'],
+    'date_from'=>['kind'=>'date','label'=>'Date from','sql'=>'a.created_at','operator'=>'>='],
+    'date_to'=>['kind'=>'date','label'=>'Date to','sql'=>'a.created_at','operator'=>'<','inclusive_end'=>true],
+    'amount_min'=>['kind'=>'number','label'=>'Minimum amount','sql'=>'a.amount_requested','operator'=>'>='],
+    'amount_max'=>['kind'=>'number','label'=>'Maximum amount','sql'=>'a.amount_requested','operator'=>'<='],
+];
+$sortMap = ['id'=>'a.id','applicant'=>'u.name','client'=>'u.name','barangay'=>'u.barangay','type'=>'a.type','amount'=>'a.amount_requested','date'=>'a.created_at','status'=>'a.status'];
 
 $report_title = match($report_type) {
     'beneficiaries' => 'Beneficiaries Report',
     'summary'       => 'Summary Report',
     default         => 'Applications Report'
 };
-
 $rows = [];
 $columns = [];
 
 if ($report_type === 'applications') {
-    $columns = ['ID','Applicant','Phone','Barangay','Type','Amount Requested','Amount Granted','Amount Released','Status','Date'];
-
-    $where = ['1=1']; $params = []; $types = '';
-    if ($f_status && !in_array($f_status, ['applications','beneficiaries','summary'])) {
-        $where[] = 'a.status = ?'; $params[] = $f_status; $types .= 's';
-    }
-    if ($f_type)     { $where[] = 'a.type = ?';           $params[] = $f_type;     $types .= 's'; }
-    if ($f_barangay) { $where[] = 'u.barangay = ?';       $params[] = $f_barangay; $types .= 's'; }
-    if ($f_from)     { $where[] = 'a.date_of_request >= ?'; $params[] = $f_from;   $types .= 's'; }
-    if ($f_to)       { $where[] = 'a.date_of_request <= ?'; $params[] = $f_to;     $types .= 's'; }
-    $where_sql = implode(' AND ', $where);
-
-    $stmt = $mysqli->prepare("
-        SELECT a.id, u.name, u.phone, u.barangay, a.type, a.amount_requested, a.amount_granted, a.amount_released, a.status, a.date_of_request
-        FROM applications a JOIN users u ON a.user_id = u.id
-        WHERE $where_sql ORDER BY a.date_of_request DESC
-    ");
-    if ($params) $stmt->bind_param($types, ...$params);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    while ($row = $result->fetch_assoc()) {
+    $columns = ['ID','Applicant','Phone','Email','Barangay','Type','Amount Requested','Amount Granted','Amount Released','Status','Date'];
+    $table = table_filter_query($mysqli, [
+        'from_sql'=>'FROM applications a JOIN users u ON a.user_id=u.id',
+        'select_sql'=>'a.id, u.name, u.phone, u.email, u.barangay, a.type, a.amount_requested, a.amount_granted, a.amount_released, a.status, a.date_of_request, a.created_at',
+        'filters'=>$filters,'sort'=>$sortMap,'default_sort'=>'date','paginate'=>false,
+    ]);
+    foreach ($table['rows'] as $row) {
         $rows[] = [
-            $row['id'], $row['name'], $row['phone'], $row['barangay'],
+            $row['id'], $row['name'], $row['phone'], $row['email'], $row['barangay'],
             ucfirst($row['type']),
             '₱' . number_format($row['amount_requested'], 2),
             '₱' . number_format($row['amount_granted'] ?? 0, 2),
@@ -54,42 +50,49 @@ if ($report_type === 'applications') {
             $row['date_of_request']
         ];
     }
-    $stmt->close();
 
 } elseif ($report_type === 'beneficiaries') {
-    $columns = ['ID','Name','Phone','Barangay','Total Apps','Approved','Pending','Rejected','Registered'];
-    $b_where = []; $b_params = []; $b_types = '';
-    if ($f_barangay) { $b_where[] = 'u.barangay = ?'; $b_params[] = $f_barangay; $b_types .= 's'; }
-    $b_where_sql = $b_where ? 'AND ' . implode(' AND ', $b_where) : '';
-    $stmt = $mysqli->prepare("
-        SELECT u.id, u.name, u.phone, u.barangay, u.created_at,
-               COUNT(a.id) AS total_apps,
-               SUM(a.status='approved') AS approved,
-               SUM(a.status='pending') AS pending,
-               SUM(a.status='rejected') AS rejected
-        FROM users u
-        INNER JOIN applications a ON u.id = a.user_id
-        WHERE u.role = 'client' $b_where_sql
-        GROUP BY u.id
-        HAVING SUM(a.status='approved') > 0
-        ORDER BY u.name ASC
-    ");
-    if ($b_params) $stmt->bind_param($b_types, ...$b_params);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    while ($row = $res->fetch_assoc()) {
-        $rows[] = [$row['id'], $row['name'], $row['phone'], $row['barangay'], $row['total_apps'], $row['approved'], $row['pending'], $row['rejected'], date('M d, Y', strtotime($row['created_at']))];
+    $columns = ['ID','Name','Phone','Email','Barangay','Total Apps','Approved','Pending','Rejected','Registered'];
+    $beneficiaryFilters = $filters;
+    $beneficiaryFilters['date_from'] = ['kind'=>'date','label'=>'Registered from','sql'=>'u.created_at','operator'=>'>='];
+    $beneficiaryFilters['date_to'] = ['kind'=>'date','label'=>'Registered to','sql'=>'u.created_at','operator'=>'<','inclusive_end'=>true];
+    $beneficiaryFilters['account_status'] = ['kind'=>'select','label'=>'Account status','options'=>['active'=>'Active','suspended'=>'Suspended'],'sql'=>'u.status'];
+    $beneficiaryFilters['applications'] = ['kind'=>'select','label'=>'Applications','options'=>['has'=>'Has applications','none'=>'Has no applications'],'expressions'=>['has'=>'EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id=u.id)','none'=>'NOT EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id=u.id)']];
+    $table = table_filter_query($mysqli, [
+        'from_sql'=>'FROM users u LEFT JOIN applications a ON a.user_id=u.id',
+        'base_where'=>"u.role='client'",'count_expression'=>'COUNT(DISTINCT u.id)',
+        'select_sql'=>"u.id, u.name, u.phone, u.email, u.barangay, u.created_at, COUNT(a.id) AS total_apps, COALESCE(SUM(a.status='approved'),0) AS approved, COALESCE(SUM(a.status='pending'),0) AS pending, COALESCE(SUM(a.status='rejected'),0) AS rejected",
+        'group_by'=>'GROUP BY u.id','filters'=>$beneficiaryFilters,
+        'sort'=>['name'=>'u.name','phone'=>'u.phone','barangay'=>'u.barangay','status'=>'u.status','total'=>'total_apps','applications'=>'total_apps','registered'=>'u.created_at','approved'=>'approved'],
+        'default_sort'=>'name','default_dir'=>'ASC','paginate'=>false,
+    ]);
+    foreach ($table['rows'] as $row) {
+        $rows[] = [$row['id'], $row['name'], $row['phone'], $row['email'], $row['barangay'], $row['total_apps'], $row['approved'], $row['pending'], $row['rejected'], date('M d, Y', strtotime($row['created_at']))];
     }
-    $stmt->close();
 
 } elseif ($report_type === 'summary') {
     $columns = ['Metric','Value'];
-    $total = get_count('applications');
-    $approved = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='approved'")->fetch_row()[0];
-    $pending  = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0];
-    $rejected = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='rejected'")->fetch_row()[0];
-    $total_req = $mysqli->query("SELECT COALESCE(SUM(amount_requested),0) FROM applications")->fetch_row()[0];
-    $total_rel = $mysqli->query("SELECT COALESCE(SUM(amount_released),0) FROM applications WHERE status='approved'")->fetch_row()[0];
+    $table = table_filter_query($mysqli, [
+        'from_sql'=>'FROM applications a JOIN users u ON a.user_id=u.id',
+        'select_sql'=>'a.id, a.type, a.status, a.amount_requested, a.amount_released, u.id AS beneficiary_id, u.barangay',
+        'filters'=>$filters,'sort'=>$sortMap,'default_sort'=>'date','paginate'=>false,
+    ]);
+    $total = count($table['rows']);
+    $approved = $pending = $rejected = 0;
+    $total_req = $total_rel = 0.0;
+    $beneficiaryIds = [];
+    $byType = [];
+    $byBarangay = [];
+    foreach ($table['rows'] as $item) {
+        if ($item['status'] === 'approved') $approved++;
+        if ($item['status'] === 'pending') $pending++;
+        if ($item['status'] === 'rejected') $rejected++;
+        $total_req += (float)$item['amount_requested'];
+        $total_rel += (float)$item['amount_released'];
+        $beneficiaryIds[(int)$item['beneficiary_id']] = true;
+        $byType[$item['type']] = ($byType[$item['type']] ?? 0) + 1;
+        $byBarangay[$item['barangay'] ?? ''] = ($byBarangay[$item['barangay'] ?? ''] ?? 0) + 1;
+    }
 
     $rows = [
         ['Total Applications', $total],
@@ -99,9 +102,13 @@ if ($report_type === 'applications') {
         ['Approval Rate', $total ? round($approved/$total*100,1).'%' : '0%'],
         ['Total Amount Requested', '₱' . number_format($total_req, 2)],
         ['Total Amount Released', '₱' . number_format($total_rel, 2)],
-        ['Total Beneficiaries', get_count('users', "role='client'")],
+        ['Total Beneficiaries', count($beneficiaryIds)],
     ];
+    foreach ($byType as $type => $count) $rows[] = ['Applications by ' . ucfirst($type), $count];
+    foreach ($byBarangay as $barangay => $count) if ($barangay !== '') $rows[] = ['Applications in ' . $barangay, $count];
 }
+$activeFilters = $table['filters'] ?? [];
+$recordCount = $table['total'] ?? count($rows);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -143,18 +150,17 @@ tr:nth-child(even) { background:#f8fafc; }
     </div>
     <div class="meta">
         <div>Generated: <?= date('F d, Y — h:i A') ?></div>
-        <div>Total Records: <?= count($rows) ?></div>
+        <div>Total Records: <?= (int)$recordCount ?></div>
     </div>
 </div>
 
-<?php if ($f_status || $f_type || $f_barangay || $f_from || $f_to): ?>
+<?php if (!empty($activeFilters) && array_filter($activeFilters, static fn($value) => $value !== '')): ?>
 <div class="filters">
     Filters applied:
-    <?php if ($f_status): ?><strong>Status:</strong> <?= ucfirst(htmlspecialchars($f_status)) ?> &nbsp;<?php endif; ?>
-    <?php if ($f_type): ?><strong>Type:</strong> <?= ucfirst(htmlspecialchars($f_type)) ?> &nbsp;<?php endif; ?>
-    <?php if ($f_barangay): ?><strong>Barangay:</strong> <?= htmlspecialchars($f_barangay) ?> &nbsp;<?php endif; ?>
-    <?php if ($f_from): ?><strong>From:</strong> <?= htmlspecialchars($f_from) ?> &nbsp;<?php endif; ?>
-    <?php if ($f_to): ?><strong>To:</strong> <?= htmlspecialchars($f_to) ?><?php endif; ?>
+    <?php foreach ($activeFilters as $filterKey => $filterValue): if ($filterValue === '') continue; ?>
+    <strong><?= htmlspecialchars(ucfirst(str_replace('_', ' ', $filterKey)), ENT_QUOTES, 'UTF-8') ?>:</strong> <?= htmlspecialchars((string)$filterValue, ENT_QUOTES, 'UTF-8') ?> &nbsp;
+    <?php endforeach; ?>
+    <strong>Sort:</strong> <?= htmlspecialchars($table['sort'] ?? 'default', ENT_QUOTES, 'UTF-8') ?> <?= htmlspecialchars($table['dir'] ?? '', ENT_QUOTES, 'UTF-8') ?>
 </div>
 <?php endif; ?>
 

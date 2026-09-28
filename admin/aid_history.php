@@ -1,49 +1,42 @@
 <?php
 // admin/aid_history.php
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
 
-// --- Filters ---
-$search_name   = trim($_GET['name'] ?? '');
-$f_barangay    = $_GET['barangay'] ?? '';
-$f_status      = $_GET['status']   ?? '';
-$f_type        = $_GET['type']     ?? '';
-
-// --- Build query ---
-$where = ['1=1']; $params = []; $types = '';
-if ($search_name)   { $where[] = 'u.name LIKE ?';    $params[] = "%$search_name%";  $types .= 's'; }
-if ($f_barangay)    { $where[] = 'u.barangay = ?';    $params[] = $f_barangay;       $types .= 's'; }
-if ($f_status)      { $where[] = 'a.status = ?';      $params[] = $f_status;         $types .= 's'; }
-if ($f_type)        { $where[] = 'a.type = ?';        $params[] = $f_type;           $types .= 's'; }
-$where_sql = implode(' AND ', $where);
-
-$aid_history = [];
-$stmt = $mysqli->prepare("
-    SELECT a.id, a.type AS assistance, a.status, a.date_of_request,
-           a.amount_requested,
-           u.name AS full_name,
-           u.barangay
-    FROM applications a
-    JOIN users u ON a.user_id = u.id
-    WHERE $where_sql
-    ORDER BY a.date_of_request DESC
-");
-if ($params) $stmt->bind_param($types, ...$params);
-$stmt->execute();
-$aid_history = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$barangay_list = array_column($mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC), 'barangay');
+$type_list = ['medical','burial','educational','livelihood','emergency'];
+$status_list = ['pending','approved','rejected','cancelled'];
+$table = table_filter_query($mysqli, [
+    'from_sql' => "FROM applications a JOIN users u ON a.user_id = u.id LEFT JOIN (SELECT application_id, MAX(created_at) AS released_at, SUBSTRING_INDEX(GROUP_CONCAT(admin_id ORDER BY created_at DESC), ',', 1) AS released_by_id FROM admin_actions WHERE action='release' GROUP BY application_id) rel ON rel.application_id = a.id LEFT JOIN users ru ON ru.id = rel.released_by_id",
+    'select_sql' => 'a.id, a.type AS assistance, a.status, a.date_of_request, a.created_at, a.amount_requested, a.amount_released, u.name AS full_name, u.phone, u.email, u.barangay, rel.released_at, ru.name AS released_by',
+    'filters' => [
+        'search' => ['kind'=>'search','label'=>'Keyword','placeholder'=>'Name, phone, email or ID','columns'=>['u.name','u.phone','u.email','CAST(a.id AS CHAR)']],
+        'barangay' => ['kind'=>'select','label'=>'Barangay','options'=>array_combine($barangay_list,$barangay_list) ?: [],'sql'=>'u.barangay'],
+        'type' => ['kind'=>'select','label'=>'Aid type','options'=>array_combine($type_list,array_map('ucfirst',$type_list)),'sql'=>'a.type'],
+        'status' => ['kind'=>'select','label'=>'Status','options'=>array_combine($status_list,array_map('ucfirst',$status_list)),'sql'=>'a.status'],
+        'date_from' => ['kind'=>'date','label'=>'Released from','sql'=>'rel.released_at','operator'=>'>='],
+        'date_to' => ['kind'=>'date','label'=>'Released to','sql'=>'rel.released_at','operator'=>'<','inclusive_end'=>true],
+        'amount_min' => ['kind'=>'number','label'=>'Amount from','sql'=>'a.amount_released','operator'=>'>='],
+        'amount_max' => ['kind'=>'number','label'=>'Amount to','sql'=>'a.amount_released','operator'=>'<='],
+        'released_by' => ['kind'=>'search','label'=>'Released by','placeholder'=>'Admin name','columns'=>['ru.name']],
+    ],
+    'sort' => ['id'=>'a.id','beneficiary'=>'u.name','barangay'=>'u.barangay','type'=>'a.type','amount'=>'a.amount_released','date'=>'rel.released_at','status'=>'a.status','released_by'=>'ru.name'],
+    'default_sort'=>'date','per_page'=>25,
+]);
+$aid_history = $table['rows'];
+$search_name = $table['filters']['search'];
+$f_barangay = $table['filters']['barangay'];
+$f_status = $table['filters']['status'];
+$f_type = $table['filters']['type'];
 
 // Dropdown data
-$barangay_list = array_column($mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay != '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC), 'barangay');
-$type_list     = ['medical','burial'];
-$status_list   = ['pending','approved','rejected'];
-
-$has_filters = $search_name || $f_barangay || $f_status || $f_type;
+$has_filters = $table['has_filters'];
 
 // Stats
-$approved_count = count(array_filter($aid_history, fn($r) => strtolower($r['status']) === 'approved'));
-$pending_count  = count(array_filter($aid_history, fn($r) => strtolower($r['status']) === 'pending'));
-$rejected_count = count(array_filter($aid_history, fn($r) => strtolower($r['status']) === 'rejected'));
+$approved_count = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='approved'")->fetch_row()[0];
+$pending_count  = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0];
+$rejected_count = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='rejected'")->fetch_row()[0];
 
 // Partials
 $active_page   = 'aid_history';
@@ -128,7 +121,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="page-sub">Complete record of all financial assistance requests and their outcomes.</div>
             </div>
             <div class="page-actions">
-                <span class="count-pill"><?= count($aid_history) ?> results</span>
+                <span class="count-pill"><?= $table['total'] ?> results</span>
                 <a href="#" class="btn btn-primary btn-sm">
                     <i data-lucide="file-down" style="width:13px;height:13px"></i> Export
                 </a>
@@ -143,7 +136,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <i data-lucide="file-text" style="width:17px;height:17px"></i>
             </div>
             <div>
-                <div class="ss-n"><?= count($aid_history) ?></div>
+                <div class="ss-n"><?= $table['total'] ?></div>
                 <div class="ss-l">Total Records</div>
             </div>
         </div>
@@ -177,59 +170,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
     </div>
 
     <!-- Filter Card -->
-    <div class="filter-card">
-        <div class="filter-title">
-            <i data-lucide="sliders-horizontal" style="width:13px;height:13px"></i>
-            Filter Records
-        </div>
-        <form method="get">
-            <div class="filter-grid">
-                <div class="filter-field">
-                    <label>Name</label>
-                    <input type="text" name="name" placeholder="e.g. Santos" value="<?= htmlspecialchars($search_name) ?>">
-                </div>
-                <div class="filter-field">
-                    <label>Barangay</label>
-                    <select name="barangay">
-                        <option value="">All Barangays</option>
-                        <?php foreach ($barangay_list as $b): ?>
-                        <option value="<?= htmlspecialchars($b) ?>" <?= $f_barangay===$b?'selected':''?>>
-                            <?= htmlspecialchars($b) ?>
-                        </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                <div class="filter-field">
-                    <label>Aid Type</label>
-                    <select name="type">
-                        <option value="">All Types</option>
-                        <?php foreach ($type_list as $t): ?>
-                        <option value="<?= $t ?>" <?= $f_type===$t?'selected':''?>><?= ucfirst($t) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                <div class="filter-field">
-                    <label>Status</label>
-                    <select name="status">
-                        <option value="">All Statuses</option>
-                        <?php foreach ($status_list as $s): ?>
-                        <option value="<?= $s ?>" <?= $f_status===$s?'selected':''?>><?= ucfirst($s) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-            </div>
-            <div class="filter-actions" style="margin-top:12px;">
-                <button type="submit" class="btn btn-primary btn-sm">
-                    <i data-lucide="search" style="width:13px;height:13px"></i> Search
-                </button>
-                <?php if ($has_filters): ?>
-                <a href="aid_history.php" class="btn btn-outline btn-sm">
-                    <i data-lucide="x" style="width:13px;height:13px"></i> Clear
-                </a>
-                <?php endif; ?>
-            </div>
-        </form>
-    </div>
+    <?php include 'partials/filter_bar.php'; ?>
 
     <!-- Table -->
     <div class="card">
@@ -237,7 +178,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             <div class="card-title">
                 <div class="card-title-icon cti-blue"><i data-lucide="history" style="width:14px;height:14px"></i></div>
                 Aid History Records
-                <span class="count-pill"><?= count($aid_history) ?> results</span>
+                <span class="count-pill"><?= $table['total'] ?> results</span>
             </div>
         </div>
         <div class="card-body no-pad">
@@ -248,16 +189,17 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table data-paginate="10">
+                <table>
                     <thead>
                         <tr>
-                            <th>#</th>
-                            <th>Beneficiary</th>
-                            <th>Barangay</th>
-                            <th>Assistance</th>
-                            <th>Amount</th>
-                            <th>Date</th>
-                            <th>Status</th>
+                            <th><?= table_sort_link($table, 'id', '#') ?></th>
+                            <th><?= table_sort_link($table, 'beneficiary', 'Beneficiary') ?></th>
+                            <th><?= table_sort_link($table, 'barangay', 'Barangay') ?></th>
+                            <th><?= table_sort_link($table, 'type', 'Assistance') ?></th>
+                            <th><?= table_sort_link($table, 'amount', 'Amount Released') ?></th>
+                            <th><?= table_sort_link($table, 'date', 'Date Released') ?></th>
+                            <th><?= table_sort_link($table, 'released_by', 'Released By') ?></th>
+                            <th><?= table_sort_link($table, 'status', 'Status') ?></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -277,14 +219,16 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         </td>
                         <td style="color:var(--muted);"><?= htmlspecialchars($row['barangay'] ?? '—') ?></td>
                         <td style="font-weight:600;"><?= htmlspecialchars(ucwords(strtolower($row['assistance']))) ?></td>
-                        <td><span class="amount">₱<?= number_format($row['amount_requested'] ?? 0, 2) ?></span></td>
-                        <td style="color:var(--muted);white-space:nowrap;"><?= htmlspecialchars($row['date_of_request']) ?></td>
+                        <td><span class="amount">₱<?= number_format($row['amount_released'] ?? 0, 2) ?></span></td>
+                        <td style="color:var(--muted);white-space:nowrap;"><?= htmlspecialchars($row['released_at'] ?? '—') ?></td>
+                        <td><?= htmlspecialchars($row['released_by'] ?? '—') ?></td>
                         <td><span class="badge <?= $bc ?>"><?= ucfirst($s) ?></span></td>
                     </tr>
                     <?php endforeach; ?>
                     </tbody>
                 </table>
             </div>
+            <?php include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>

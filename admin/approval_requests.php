@@ -1,26 +1,43 @@
 <?php
 // admin/approval_requests.php — Admin view of their submitted requests
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
 
 $user_id = $_SESSION['user']['id'];
 $is_sa   = is_super_admin();
 
-// SA sees all; admin sees only their own
-$where_sql = $is_sa ? '' : 'WHERE ar.requested_by = ' . $user_id;
-
-$stmt = $mysqli->prepare("
-    SELECT ar.*, u.name AS requester_name,
-           sa.name AS reviewer_name
-    FROM approval_requests ar
-    LEFT JOIN users u  ON ar.requested_by = u.id
-    LEFT JOIN users sa ON ar.reviewed_by  = sa.id
-    $where_sql
-    ORDER BY ar.created_at DESC
-");
-$stmt->execute();
-$requests = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$categoryOptions = ['medical'=>'Medical','burial'=>'Burial','educational'=>'Educational','livelihood'=>'Livelihood','emergency'=>'Emergency'];
+$requestTypeOptions = [
+    'approve_application'=>'Approve Application','reject_application'=>'Reject Application','release_funds'=>'Release Funds',
+    'delete_user'=>'Delete User','update_budget'=>'Update Budget','suspend_account'=>'Suspend Account',
+    'bulk_approve'=>'Bulk Approve','record_modification'=>'Record Modification',
+];
+$barangayRows = $mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC);
+$barangayOptions = array_column($barangayRows, 'barangay');
+$barangayOptions = array_combine($barangayOptions, $barangayOptions) ?: [];
+$requestFrom = "FROM approval_requests ar LEFT JOIN users u ON ar.requested_by=u.id LEFT JOIN users sa ON ar.reviewed_by=sa.id LEFT JOIN applications app ON app.id=COALESCE(CASE WHEN ar.request_type IN ('approve_application','reject_application','release_funds') THEN ar.reference_id END, CAST(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data,'$.app_id')) AS UNSIGNED)) LEFT JOIN users beneficiary ON beneficiary.id=app.user_id LEFT JOIN users target_user ON target_user.id=CAST(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data,'$.user_id')) AS UNSIGNED)";
+$table = table_filter_query($mysqli, [
+    'from_sql'=>$requestFrom,
+    'base_where'=>$is_sa ? '' : 'ar.requested_by = ?',
+    'base_params'=>$is_sa ? [] : [$user_id],
+    'base_types'=>$is_sa ? '' : 'i',
+    'select_sql'=>"ar.*, u.name AS requester_name, u.phone AS requester_phone, u.email AS requester_email, sa.name AS reviewer_name, app.type AS app_type, app.amount_requested, beneficiary.name AS beneficiary_name, beneficiary.barangay",
+    'filters'=>[
+        'search'=>['kind'=>'search','label'=>'Keyword','placeholder'=>'Requester, ID or reason','columns'=>['u.name','u.phone','u.email','ar.reason','CAST(ar.id AS CHAR)','CAST(ar.reference_id AS CHAR)','beneficiary.name','target_user.name']],
+        'status'=>['kind'=>'select','label'=>'Status','options'=>['pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected','released'=>'Linked application released'],'sql'=>'ar.status','expressions'=>['released'=>'app.amount_released > 0']],
+        'type'=>['kind'=>'select','label'=>'Request type','options'=>$requestTypeOptions,'sql'=>'ar.request_type'],
+        'aid_type'=>['kind'=>'select','label'=>'Aid category','options'=>$categoryOptions,'sql'=>'COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, \'$.app_type\')), app.type)'],
+        'barangay'=>['kind'=>'select','label'=>'Barangay','options'=>$barangayOptions,'sql'=>'COALESCE(beneficiary.barangay,target_user.barangay)'],
+        'date_from'=>['kind'=>'date','label'=>'Submitted from','sql'=>'ar.created_at','operator'=>'>='],
+        'date_to'=>['kind'=>'date','label'=>'Submitted to','sql'=>'ar.created_at','operator'=>'<','inclusive_end'=>true],
+        'amount_min'=>['kind'=>'number','label'=>'Amount from','sql'=>"CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_granted')), JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_released'))) AS DECIMAL(12,2))",'operator'=>'>='],
+        'amount_max'=>['kind'=>'number','label'=>'Amount to','sql'=>"CAST(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_granted')), JSON_UNQUOTE(JSON_EXTRACT(ar.request_data, '$.amount_released'))) AS DECIMAL(12,2))",'operator'=>'<='],
+    ],
+    'sort'=>['id'=>'ar.id','requester'=>'u.name','type'=>'ar.request_type','status'=>'ar.status','submitted'=>'ar.created_at','reviewed'=>'ar.reviewed_at'],
+    'default_sort'=>'submitted','per_page'=>25,
+]);
+$requests = $table['rows'];
 
 $pending_aids         = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
 $pending_sa_approvals = get_pending_approvals_count($mysqli);
@@ -40,12 +57,16 @@ $type_labels = [
     'record_modification'  => 'Record Modification',
 ];
 
-$counts = [
-    'all'      => count($requests),
-    'pending'  => count(array_filter($requests, fn($r) => $r['status'] === 'pending')),
-    'approved' => count(array_filter($requests, fn($r) => $r['status'] === 'approved')),
-    'rejected' => count(array_filter($requests, fn($r) => $r['status'] === 'rejected')),
-];
+$counts = ['all'=>0,'pending'=>0,'approved'=>0,'rejected'=>0];
+$countSql = $is_sa ? "SELECT status, COUNT(*) AS total FROM approval_requests GROUP BY status" : "SELECT status, COUNT(*) AS total FROM approval_requests WHERE requested_by=? GROUP BY status";
+$countStmt = $mysqli->prepare($countSql);
+if (!$is_sa) $countStmt->bind_param('i', $user_id);
+$countStmt->execute();
+foreach ($countStmt->get_result()->fetch_all(MYSQLI_ASSOC) as $countRow) {
+    $counts[$countRow['status']] = (int)$countRow['total'];
+    $counts['all'] += (int)$countRow['total'];
+}
+$countStmt->close();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -138,14 +159,7 @@ $counts = [
             </div>
         </div>
 
-        <div class="tabs">
-            <button class="tab active" onclick="filterTable('all', this)">All (<?= $counts['all'] ?>)</button>
-            <button class="tab" onclick="filterTable('pending', this)">
-                Pending <?php if ($counts['pending'] > 0): ?><span class="nav-badge" style="position:static;margin-left:6px;"><?= $counts['pending'] ?></span><?php endif; ?>
-            </button>
-            <button class="tab" onclick="filterTable('approved', this)">Approved (<?= $counts['approved'] ?>)</button>
-            <button class="tab" onclick="filterTable('rejected', this)">Rejected (<?= $counts['rejected'] ?>)</button>
-        </div>
+        <?php include 'partials/filter_bar.php'; ?>
 
         <div class="card-body no-pad">
             <?php if (empty($requests)): ?>
@@ -155,18 +169,18 @@ $counts = [
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table data-paginate="12">
+                <table>
                     <thead>
                         <tr>
-                            <th>#</th>
-                            <?php if ($is_sa): ?><th>Requested By</th><?php endif; ?>
-                            <th>Type</th>
+                            <th><?= table_sort_link($table, 'id', '#') ?></th>
+                            <?php if ($is_sa): ?><th><?= table_sort_link($table, 'requester', 'Requested By') ?></th><?php endif; ?>
+                            <th><?= table_sort_link($table, 'type', 'Type') ?></th>
                             <th>Reason</th>
-                            <th>Status</th>
+                            <th><?= table_sort_link($table, 'status', 'Status') ?></th>
                             <th>Reviewer</th>
                             <th>Review Notes</th>
-                            <th>Submitted</th>
-                            <th>Reviewed</th>
+                            <th><?= table_sort_link($table, 'submitted', 'Submitted') ?></th>
+                            <th><?= table_sort_link($table, 'reviewed', 'Reviewed') ?></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -176,7 +190,7 @@ $counts = [
                         $sc  = 'sp-' . $req['status'];
                         $data = json_decode($req['request_data'] ?? '{}', true);
                     ?>
-                    <tr data-status="<?= $req['status'] ?>">
+                    <tr>
                         <td style="color:var(--muted);font-size:.74rem;"><?= $req['id'] ?></td>
                         <?php if ($is_sa): ?>
                         <td style="font-weight:700;font-size:.82rem;"><?= htmlspecialchars($req['requester_name'] ?? '—') ?></td>
@@ -201,6 +215,7 @@ $counts = [
                     </tbody>
                 </table>
             </div>
+            <?php include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>
@@ -208,14 +223,5 @@ $counts = [
 </main>
 
 <script src="partials/admin.js"></script>
-<script>
-function filterTable(status, btn) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    btn.classList.add('active');
-    document.querySelectorAll('tbody tr').forEach(row => {
-        row.style.display = (status === 'all' || row.dataset.status === status) ? '' : 'none';
-    });
-}
-</script>
 </body>
 </html>

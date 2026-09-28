@@ -15,12 +15,20 @@ CREATE TABLE IF NOT EXISTS users (
   id            INT AUTO_INCREMENT PRIMARY KEY,
   phone         VARCHAR(20)  NOT NULL UNIQUE,
   name          VARCHAR(255) NOT NULL,
-  email         VARCHAR(255),
+  email         VARCHAR(255) NULL,
+  email_verified TINYINT(1) NOT NULL DEFAULT 0,
+  verification_token_hash CHAR(64) NULL,
+  verification_expires DATETIME NULL,
   barangay      VARCHAR(100),
   password_hash VARCHAR(255) NOT NULL,
   role          ENUM('client','admin','super_admin') DEFAULT 'client',
   status        ENUM('active','suspended') DEFAULT 'active',
-  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_users_email (email),
+    KEY idx_users_role_created (role, created_at),
+    KEY idx_users_created_at (created_at),
+    KEY idx_users_barangay_created (barangay, created_at),
+    KEY idx_users_verified_role (email_verified, role)
 ) ENGINE=InnoDB;
 ";
 
@@ -37,6 +45,13 @@ CREATE TABLE IF NOT EXISTS applications (
   rejection_reason  TEXT,
   notes             TEXT,
   created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_applications_status_created (status, created_at),
+    KEY idx_applications_created_at (created_at),
+    KEY idx_applications_type_created (type, created_at),
+    KEY idx_applications_request_date (date_of_request),
+    KEY idx_applications_amount_requested (amount_requested),
+    KEY idx_applications_amount_released (amount_released),
+    KEY idx_applications_user_created (user_id, created_at),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 ";
@@ -73,6 +88,8 @@ CREATE TABLE IF NOT EXISTS admin_actions (
   action         VARCHAR(50) NOT NULL,
   details        TEXT,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_admin_actions_app_action_date (application_id, action, created_at),
+    KEY idx_admin_actions_admin_date (admin_id, created_at),
   FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE SET NULL,
   FOREIGN KEY (admin_id)       REFERENCES users(id)         ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -99,7 +116,8 @@ CREATE TABLE IF NOT EXISTS budgets (
   used_budget       DECIMAL(14,2) DEFAULT 0.00,
   max_amount        DECIMAL(12,2) DEFAULT 0.00,
   reapply_interval_months INT DEFAULT 6,
-  updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_budgets_updated_at (updated_at)
 ) ENGINE=InnoDB;
 ";
 
@@ -124,6 +142,10 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   details     TEXT,
   ip_address  VARCHAR(45),
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_audit_logs_created (created_at),
+    KEY idx_audit_logs_user_created (user_id, created_at),
+    KEY idx_audit_logs_action_created (action, created_at),
+    KEY idx_audit_logs_ip (ip_address),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
 ";
@@ -151,6 +173,11 @@ CREATE TABLE IF NOT EXISTS approval_requests (
   review_notes   TEXT,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   reviewed_at    TIMESTAMP NULL,
+    KEY idx_approval_status_created (status, created_at),
+    KEY idx_approval_created_at (created_at),
+    KEY idx_approval_requester_status_created (requested_by, status, created_at),
+    KEY idx_approval_type_created (request_type, created_at),
+    KEY idx_approval_reference (reference_id),
   FOREIGN KEY (requested_by) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY (reviewed_by)  REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;

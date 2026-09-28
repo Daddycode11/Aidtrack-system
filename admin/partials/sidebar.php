@@ -33,7 +33,7 @@ $nav_items = [
         'links' => [
             ['key'=>'beneficiaries', 'href'=>'beneficiaries.php', 'icon'=>'users',    'label'=>'Beneficiaries'],
             ['key'=>'aid_history',   'href'=>'aid_history.php',   'icon'=>'history',  'label'=>'Aid History'],
-            ['key'=>'users',         'href'=>'user.php',          'icon'=>'user-cog', 'label'=>'Users'],
+            $is_sa_nav ? ['key'=>'users', 'href'=>'user.php', 'icon'=>'user-cog', 'label'=>'Users'] : null,
         ]
     ],
     [
@@ -49,7 +49,7 @@ $nav_items = [
     [
         'section' => 'Management',
         'links' => [
-            ['key'=>'audit_trail', 'href'=>'audit_trail.php', 'icon'=>'shield-check', 'label'=>'Audit Trail'],
+            $is_sa_nav ? ['key'=>'audit_trail', 'href'=>'audit_trail.php', 'icon'=>'shield-check', 'label'=>'Audit Trail'] : null,
             ['key'=>'analytics',   'href'=>'analytics.php',   'icon'=>'bar-chart-3',  'label'=>'Analytics'],
             ['key'=>'export',      'href'=>'export_reports.php', 'icon'=>'file-down', 'label'=>'Export Reports'],
         ]

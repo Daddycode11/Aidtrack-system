@@ -1,7 +1,8 @@
 <?php
 // admin/user.php
 require_once __DIR__ . '/../helpers.php';
-require_admin();
+require_once __DIR__ . '/../helpers/table_filters.php';
+require_super_admin();
 
 $admin_id = $_SESSION['user']['id'] ?? 0;
 $is_sa    = is_super_admin();
@@ -65,22 +66,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delet
 }
 
 // --- Filter ---
-$search  = trim($_GET['search'] ?? '');
-$f_role  = $_GET['role'] ?? '';
-
-$where  = []; $params = []; $types = '';
-if ($search) { $where[] = '(name LIKE ? OR phone LIKE ?)'; $params[] = "%$search%"; $params[] = "%$search%"; $types .= 'ss'; }
-if ($f_role) { $where[] = 'role = ?'; $params[] = $f_role; $types .= 's'; }
-$where_sql = $where ? 'WHERE '.implode(' AND ', $where) : '';
-
-$stmt = $mysqli->prepare("
-    SELECT id, name, phone, barangay, role, status, created_at
-    FROM users $where_sql ORDER BY created_at DESC
-");
-if ($params) $stmt->bind_param($types, ...$params);
-$stmt->execute();
-$users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$table = table_filter_query($mysqli, [
+    'from_sql' => 'FROM users',
+    'select_sql' => 'id, name, phone, email, email_verified, barangay, role, status, created_at',
+    'filters' => [
+        'search' => ['kind'=>'search','label'=>'Keyword','placeholder'=>'Name, email or phone','columns'=>['name','email','phone']],
+        'role' => ['kind'=>'select','label'=>'Role','options'=>['client'=>'Beneficiary','admin'=>'Admin','super_admin'=>'Super Admin'],'sql'=>'role'],
+        'verified' => ['kind'=>'select','label'=>'Email verified','options'=>['yes'=>'Verified','no'=>'Not verified'],'expressions'=>['yes'=>"role IN ('admin','super_admin') AND email_verified = 1",'no'=>"role IN ('admin','super_admin') AND email_verified = 0"]],
+        'date_from' => ['kind'=>'date','label'=>'Created from','sql'=>'created_at','operator'=>'>='],
+        'date_to' => ['kind'=>'date','label'=>'Created to','sql'=>'created_at','operator'=>'<','inclusive_end'=>true],
+    ],
+    'sort' => ['name'=>'name','email'=>'email','role'=>'role','verified'=>'email_verified','created'=>'created_at'],
+    'default_sort'=>'created','per_page'=>25,
+]);
+$users = $table['rows'];
+$search = $table['filters']['search'];
+$f_role = $table['filters']['role'];
 
 // Role counts
 $role_counts = [];
@@ -174,7 +175,7 @@ function role_badge(string $role): string {
                 <div class="page-sub">Manage all registered system users, roles, and access levels.</div>
             </div>
             <div class="page-actions">
-                <span class="count-pill"><?= count($users) ?> total</span>
+                <span class="count-pill"><?= $table['total'] ?> total</span>
                 <a href="user_create.php" class="btn btn-primary btn-sm">
                     <i data-lucide="user-plus" style="width:13px;height:13px"></i> Add User
                 </a>
@@ -209,32 +210,12 @@ function role_badge(string $role): string {
             <div class="card-title">
                 <div class="card-title-icon cti-blue"><i data-lucide="user-cog" style="width:14px;height:14px"></i></div>
                 System Users
-                <span class="count-pill"><?= count($users) ?></span>
+                <span class="count-pill"><?= $table['total'] ?></span>
             </div>
         </div>
 
         <!-- Filter bar -->
-        <form method="get" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:13px 18px;border-bottom:1px solid var(--border);background:var(--bg);">
-            <i data-lucide="search" style="width:14px;height:14px;color:var(--muted)"></i>
-            <input type="text" name="search" placeholder="Search by name or phone…"
-                   value="<?= htmlspecialchars($search) ?>"
-                   style="flex:1;min-width:160px;font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
-            <select name="role" style="font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
-                <option value="">All Roles</option>
-                <option value="client"      <?= $f_role==='client'     ?'selected':''?>>Beneficiary</option>
-                <option value="admin"       <?= $f_role==='admin'      ?'selected':''?>>Admin</option>
-                <option value="staff"       <?= $f_role==='staff'      ?'selected':''?>>Staff</option>
-                <option value="super_admin" <?= $f_role==='super_admin'?'selected':''?>>Super Admin</option>
-            </select>
-            <button type="submit" class="btn btn-primary btn-sm">
-                <i data-lucide="filter" style="width:13px;height:13px"></i> Filter
-            </button>
-            <?php if ($search || $f_role): ?>
-            <a href="user.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
-                <i data-lucide="x" style="width:12px;height:12px;vertical-align:middle"></i> Clear
-            </a>
-            <?php endif; ?>
-        </form>
+        <?php include 'partials/filter_bar.php'; ?>
 
         <div class="card-body no-pad">
             <?php if (empty($users)): ?>
@@ -244,15 +225,17 @@ function role_badge(string $role): string {
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table data-paginate="10">
+                <table>
                     <thead>
                         <tr>
-                            <th>User</th>
+                            <th><?= table_sort_link($table, 'name', 'User') ?></th>
+                            <th><?= table_sort_link($table, 'email', 'Email') ?></th>
+                            <th>Email verified</th>
                             <th>Phone</th>
                             <th>Barangay</th>
-                            <th>Role</th>
+                            <th><?= table_sort_link($table, 'role', 'Role') ?></th>
                             <th>Status</th>
-                            <th>Joined</th>
+                            <th><?= table_sort_link($table, 'created', 'Joined') ?></th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -265,7 +248,7 @@ function role_badge(string $role): string {
                     <tr>
                         <td>
                             <div style="display:flex;align-items:center;gap:9px;">
-                                <div class="row-avatar" style="background:<?= $col ?>"><?= $init ?></div>
+                                <div class="row-avatar" style="background:<?= $col ?>"><?= htmlspecialchars($init, ENT_QUOTES, 'UTF-8') ?></div>
                                 <div>
                                     <div style="font-weight:700;font-size:.82rem;color:var(--navy);">
                                         <?= htmlspecialchars($u['name']) ?>
@@ -277,7 +260,9 @@ function role_badge(string $role): string {
                                 </div>
                             </div>
                         </td>
-                        <td style="font-family:monospace;font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['phone'] ?? '—') ?></td>
+                        <td style="font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['email'] ?? '—', ENT_QUOTES, 'UTF-8') ?></td>
+                        <td><?= in_array($u['role'], ['admin','super_admin'], true) ? ((int)$u['email_verified'] === 1 ? 'Verified' : 'Pending') : '—' ?></td>
+                        <td style="font-family:monospace;font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['phone'] ?? '—', ENT_QUOTES, 'UTF-8') ?></td>
                         <td style="color:var(--muted);"><?= htmlspecialchars($u['barangay'] ?? '—') ?></td>
                         <td><?= role_badge($u['role']) ?></td>
                         <td>
@@ -334,6 +319,7 @@ function role_badge(string $role): string {
                     </tbody>
                 </table>
             </div>
+            <?php include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>

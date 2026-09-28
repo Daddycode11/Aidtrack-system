@@ -1,144 +1,139 @@
 <?php
 // admin/export_reports.php
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
+
+function export_csv_row($output, array $values): void
+{
+    $values = array_map(static function ($value): string {
+        $cell = (string)($value ?? '');
+        return preg_match('/\A[=+\-@]/', $cell) ? "'" . $cell : $cell;
+    }, $values);
+    fputcsv($output, $values);
+}
 
 // --- Handle CSV Export ---
 if (isset($_GET['export'])) {
-    $export_type = $_GET['export'];
-    $f_status    = $_GET['status']   ?? '';
-    $f_type      = $_GET['type']     ?? '';
-    $f_from      = $_GET['date_from'] ?? '';
-    $f_to        = $_GET['date_to']   ?? '';
-    $f_barangay  = $_GET['barangay']  ?? '';
+    $export_type = is_string($_GET['export']) ? $_GET['export'] : '';
+    if (!in_array($export_type, ['applications','beneficiaries','summary'], true)) {
+        http_response_code(400);
+        exit('Invalid export type.');
+    }
+
+    $barangayRows = $mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC);
+    $barangayValues = array_column($barangayRows, 'barangay');
+    $barangayOptions = array_combine($barangayValues, $barangayValues) ?: [];
+    $typeOptions = ['medical'=>'Medical','burial'=>'Burial','educational'=>'Educational','livelihood'=>'Livelihood','emergency'=>'Emergency'];
+    $statusOptions = ['pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected','cancelled'=>'Cancelled','released'=>'Released'];
+    $commonFilters = [
+        'search'=>['kind'=>'search','label'=>'Keyword','columns'=>['u.name','u.phone','u.email','CAST(a.id AS CHAR)']],
+        'status'=>['kind'=>'select','label'=>'Status','options'=>$statusOptions,'sql'=>'a.status','expressions'=>['released'=>'a.amount_released > 0']],
+        'type'=>['kind'=>'select','label'=>'Aid type','options'=>$typeOptions,'sql'=>'a.type'],
+        'barangay'=>['kind'=>'select','label'=>'Barangay','options'=>$barangayOptions,'sql'=>'u.barangay'],
+        'date_from'=>['kind'=>'date','label'=>'Date from','sql'=>'a.created_at','operator'=>'>='],
+        'date_to'=>['kind'=>'date','label'=>'Date to','sql'=>'a.created_at','operator'=>'<','inclusive_end'=>true],
+        'amount_min'=>['kind'=>'number','label'=>'Minimum amount','sql'=>'a.amount_requested','operator'=>'>='],
+        'amount_max'=>['kind'=>'number','label'=>'Maximum amount','sql'=>'a.amount_requested','operator'=>'<='],
+    ];
+    $commonSort = ['id'=>'a.id','applicant'=>'u.name','client'=>'u.name','barangay'=>'u.barangay','type'=>'a.type','amount'=>'a.amount_requested','date'=>'a.created_at','status'=>'a.status'];
 
     header('Content-Type: text/csv; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
     $output = fopen('php://output', 'w');
 
     if ($export_type === 'applications') {
         header('Content-Disposition: attachment; filename="applications_report_' . date('Y-m-d') . '.csv"');
-
-        $where = ['1=1']; $params = []; $types = '';
-        if ($f_status)   { $where[] = 'a.status = ?';            $params[] = $f_status;   $types .= 's'; }
-        if ($f_type)     { $where[] = 'a.type = ?';              $params[] = $f_type;     $types .= 's'; }
-        if ($f_barangay) { $where[] = 'u.barangay = ?';          $params[] = $f_barangay; $types .= 's'; }
-        if ($f_from)     { $where[] = 'a.date_of_request >= ?';  $params[] = $f_from;     $types .= 's'; }
-        if ($f_to)       { $where[] = 'a.date_of_request <= ?';  $params[] = $f_to;       $types .= 's'; }
-        $where_sql = implode(' AND ', $where);
-
-        fputcsv($output, ['ID', 'Applicant', 'Phone', 'Barangay', 'Type', 'Amount Requested', 'Status', 'Date of Request', 'Created At']);
-
-        $stmt = $mysqli->prepare("
-            SELECT a.id, u.name, u.phone, u.barangay, a.type, a.amount_requested, a.status, a.date_of_request, a.created_at
-            FROM applications a JOIN users u ON a.user_id = u.id
-            WHERE $where_sql ORDER BY a.date_of_request DESC
-        ");
-        if ($params) $stmt->bind_param($types, ...$params);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        while ($row = $result->fetch_assoc()) {
-            fputcsv($output, [
-                $row['id'], $row['name'], $row['phone'], $row['barangay'],
-                ucfirst($row['type']), $row['amount_requested'], ucfirst($row['status']),
-                $row['date_of_request'], $row['created_at']
-            ]);
+        $table = table_filter_query($mysqli, [
+            'from_sql'=>'FROM applications a JOIN users u ON a.user_id=u.id',
+            'select_sql'=>'a.id, u.name, u.phone, u.email, u.barangay, a.type, a.amount_requested, a.amount_granted, a.amount_released, a.status, a.date_of_request, a.created_at',
+            'filters'=>$commonFilters,'sort'=>$commonSort,'default_sort'=>'date','paginate'=>false,
+        ]);
+        export_csv_row($output, ['ID','Applicant','Phone','Email','Barangay','Type','Amount Requested','Amount Granted','Amount Released','Status','Date of Request','Submitted At']);
+        foreach ($table['rows'] as $row) {
+            export_csv_row($output, [$row['id'],$row['name'],$row['phone'],$row['email'],$row['barangay'],ucfirst($row['type']),$row['amount_requested'],$row['amount_granted'],$row['amount_released'],ucfirst($row['status']),$row['date_of_request'],$row['created_at']]);
         }
-        $stmt->close();
 
     } elseif ($export_type === 'beneficiaries') {
         header('Content-Disposition: attachment; filename="beneficiaries_report_' . date('Y-m-d') . '.csv"');
-
-        fputcsv($output, ['ID', 'Name', 'Phone', 'Barangay', 'Total Applications', 'Approved', 'Pending', 'Rejected', 'Registered']);
-
-        // Only include beneficiaries who have at least one approved application
-        $res = $mysqli->query("
-            SELECT u.id, u.name, u.phone, u.barangay, u.created_at,
-                   COUNT(a.id) AS total_apps,
-                   SUM(a.status='approved') AS approved,
-                   SUM(a.status='pending') AS pending,
-                   SUM(a.status='rejected') AS rejected
-            FROM users u
-            INNER JOIN applications a ON u.id = a.user_id
-            WHERE u.role = 'client'
-            GROUP BY u.id
-            HAVING SUM(a.status='approved') > 0
-            ORDER BY u.name ASC
-        ");
-        while ($row = $res->fetch_assoc()) {
-            fputcsv($output, [
-                $row['id'], $row['name'], $row['phone'], $row['barangay'],
-                $row['total_apps'], $row['approved'], $row['pending'], $row['rejected'], $row['created_at']
-            ]);
+        $beneficiaryFilters = $commonFilters;
+        $beneficiaryFilters['date_from'] = ['kind'=>'date','label'=>'Registered from','sql'=>'u.created_at','operator'=>'>='];
+        $beneficiaryFilters['date_to'] = ['kind'=>'date','label'=>'Registered to','sql'=>'u.created_at','operator'=>'<','inclusive_end'=>true];
+        $beneficiaryFilters['account_status'] = ['kind'=>'select','label'=>'Account status','options'=>['active'=>'Active','suspended'=>'Suspended'],'sql'=>'u.status'];
+        $beneficiaryFilters['applications'] = ['kind'=>'select','label'=>'Applications','options'=>['has'=>'Has applications','none'=>'Has no applications'],'expressions'=>['has'=>'EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id=u.id)','none'=>'NOT EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id=u.id)']];
+        $table = table_filter_query($mysqli, [
+            'from_sql'=>'FROM users u LEFT JOIN applications a ON a.user_id=u.id',
+            'base_where'=>"u.role='client'",'count_expression'=>'COUNT(DISTINCT u.id)',
+            'select_sql'=>"u.id, u.name, u.phone, u.email, u.barangay, u.created_at, COUNT(a.id) AS total_apps, COALESCE(SUM(a.status='approved'),0) AS approved, COALESCE(SUM(a.status='pending'),0) AS pending, COALESCE(SUM(a.status='rejected'),0) AS rejected",
+            'group_by'=>'GROUP BY u.id','filters'=>$beneficiaryFilters,
+            'sort'=>['name'=>'u.name','phone'=>'u.phone','barangay'=>'u.barangay','status'=>'u.status','total'=>'total_apps','applications'=>'total_apps','registered'=>'u.created_at','approved'=>'approved'],
+            'default_sort'=>'name','default_dir'=>'ASC','paginate'=>false,
+        ]);
+        export_csv_row($output, ['ID','Name','Phone','Email','Barangay','Total Applications','Approved','Pending','Rejected','Registered']);
+        foreach ($table['rows'] as $row) {
+            export_csv_row($output, [$row['id'],$row['name'],$row['phone'],$row['email'],$row['barangay'],$row['total_apps'],$row['approved'],$row['pending'],$row['rejected'],$row['created_at']]);
         }
 
     } elseif ($export_type === 'summary') {
         header('Content-Disposition: attachment; filename="summary_report_' . date('Y-m-d') . '.csv"');
 
-        fputcsv($output, ['Metric', 'Value']);
+        export_csv_row($output, ['Metric', 'Value']);
 
-        $total = get_count('applications');
-        $approved = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='approved'")->fetch_row()[0];
-        $pending  = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0];
-        $rejected = (int)$mysqli->query("SELECT COUNT(*) FROM applications WHERE status='rejected'")->fetch_row()[0];
-        $total_requested = $mysqli->query("SELECT COALESCE(SUM(amount_requested),0) FROM applications")->fetch_row()[0];
-        $total_approved_amt = $mysqli->query("SELECT COALESCE(SUM(amount_requested),0) FROM applications WHERE status='approved'")->fetch_row()[0];
+        $table = table_filter_query($mysqli, [
+            'from_sql'=>'FROM applications a JOIN users u ON a.user_id=u.id',
+            'select_sql'=>'a.id, a.type, a.status, a.amount_requested, a.amount_released, u.id AS beneficiary_id, u.barangay',
+            'filters'=>$commonFilters,'sort'=>$commonSort,'default_sort'=>'date','paginate'=>false,
+        ]);
+        $total = count($table['rows']);
+        $approved = $pending = $rejected = 0;
+        $total_requested = $total_approved_amt = 0.0;
+        $beneficiaries = $byType = $byBarangay = [];
+        foreach ($table['rows'] as $item) {
+            if ($item['status'] === 'approved') {
+                $approved++;
+                $total_approved_amt += (float)$item['amount_requested'];
+            }
+            if ($item['status'] === 'pending') $pending++;
+            if ($item['status'] === 'rejected') $rejected++;
+            $total_requested += (float)$item['amount_requested'];
+            $beneficiaries[(int)$item['beneficiary_id']] = true;
+            $byType[$item['type']] = ($byType[$item['type']] ?? 0) + 1;
+            $byBarangay[$item['barangay'] ?? ''] = ($byBarangay[$item['barangay'] ?? ''] ?? 0) + 1;
+        }
 
-        fputcsv($output, ['Total Applications', $total]);
-        fputcsv($output, ['Approved', $approved]);
-        fputcsv($output, ['Pending', $pending]);
-        fputcsv($output, ['Rejected', $rejected]);
-        fputcsv($output, ['Approval Rate', $total ? round($approved/$total*100,1).'%' : '0%']);
-        fputcsv($output, ['Total Amount Requested', number_format($total_requested, 2)]);
-        fputcsv($output, ['Total Amount Approved', number_format($total_approved_amt, 2)]);
-        fputcsv($output, ['Total Beneficiaries', get_count('users', "role='client'")]);
-        fputcsv($output, ['Report Date', date('Y-m-d H:i:s')]);
+        export_csv_row($output, ['Total Applications', $total]);
+        export_csv_row($output, ['Approved', $approved]);
+        export_csv_row($output, ['Pending', $pending]);
+        export_csv_row($output, ['Rejected', $rejected]);
+        export_csv_row($output, ['Approval Rate', $total ? round($approved/$total*100,1).'%' : '0%']);
+        export_csv_row($output, ['Total Amount Requested', number_format($total_requested, 2)]);
+        export_csv_row($output, ['Total Amount Approved', number_format($total_approved_amt, 2)]);
+        export_csv_row($output, ['Total Beneficiaries', count($beneficiaries)]);
+        export_csv_row($output, ['Report Date', date('Y-m-d H:i:s')]);
 
         // By type
-        fputcsv($output, []);
-        fputcsv($output, ['--- Applications by Type ---']);
-        $res = $mysqli->query("SELECT type, COUNT(*) AS count FROM applications GROUP BY type ORDER BY count DESC");
-        while ($row = $res->fetch_assoc()) {
-            fputcsv($output, [ucfirst($row['type']), $row['count']]);
-        }
+        export_csv_row($output, []);
+        export_csv_row($output, ['--- Applications by Type ---']);
+        foreach ($byType as $type => $count) export_csv_row($output, [ucfirst($type), $count]);
 
         // By barangay
-        fputcsv($output, []);
-        fputcsv($output, ['--- Applications by Barangay ---']);
-        $res = $mysqli->query("
-            SELECT u.barangay, COUNT(*) AS count
-            FROM applications a JOIN users u ON a.user_id = u.id
-            WHERE u.barangay IS NOT NULL AND u.barangay != ''
-            GROUP BY u.barangay ORDER BY count DESC
-        ");
-        while ($row = $res->fetch_assoc()) {
-            fputcsv($output, [$row['barangay'], $row['count']]);
-        }
+        export_csv_row($output, []);
+        export_csv_row($output, ['--- Applications by Barangay ---']);
+        foreach ($byBarangay as $barangay => $count) if ($barangay !== '') export_csv_row($output, [$barangay, $count]);
     }
 
     fclose($output);
     exit;
 }
 
-// --- Samarica barangay list ---
-$samarica_barangays = [
-    'Barangay 1 (Poblacion)','Barangay 2 (Poblacion)','Barangay 3 (Poblacion)',
-    'Barangay 4 (Poblacion)','Barangay 5 (Poblacion)','Barangay 6 (Poblacion)',
-    'Araw ng Bayan','Bagong Silang','Batangas','Bayanan','Buenavista',
-    'Caguray','Calumpang','Guinobatan','Ibaba','Iba','Ilaya',
-    'Kaingin','Kalamias','Kasay','Kaylaway','Lalud','Luyahan',
-    'Mabini','Magampon','Makina','Manggahan','Marasigan','Matagbak',
-    'Palanas','Parang','Pinagsibaan','Putol','Sabang',
-    'San Agustin','San Antonio','San Isidro','San Jose','San Pablo',
-    'San Pedro','San Rafael','Santol','Santo Niño','Silangan',
-    'Sinipian','Tabing Dagat','Tibag','Tulay',
-];
+$samarica_barangays = array_column($mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC), 'barangay');
 
 // --- Page Data ---
 $pending_aids = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
 $total_apps   = get_count('applications');
 $total_users  = get_count('users', "role='client'");
-$type_list    = ['medical','burial'];
-$status_list  = ['pending','approved','rejected'];
+$type_list    = ['medical','burial','educational','livelihood','emergency'];
+$status_list  = ['pending','approved','rejected','cancelled','released'];
 
 // Recent exports log (just show available reports)
 $report_types = [
@@ -297,6 +292,10 @@ $page_subtitle = 'Export Reports';
         </div>
         <div class="filter-grid" style="grid-template-columns:repeat(3,1fr);">
             <div class="filter-field">
+                <label>Keyword</label>
+                <input type="search" id="filterSearch" placeholder="Name, phone, email or ID">
+            </div>
+            <div class="filter-field">
                 <label>Status</label>
                 <select id="filterStatus">
                     <option value="">All Statuses</option>
@@ -330,6 +329,24 @@ $page_subtitle = 'Export Reports';
             <div class="filter-field">
                 <label>Date To</label>
                 <input type="date" id="filterTo">
+            </div>
+            <div class="filter-field">
+                <label>Minimum Amount</label>
+                <input type="number" id="filterAmountMin" min="0" step="0.01">
+            </div>
+            <div class="filter-field">
+                <label>Maximum Amount</label>
+                <input type="number" id="filterAmountMax" min="0" step="0.01">
+            </div>
+            <div class="filter-field">
+                <label>Sort By</label>
+                <select id="filterSort">
+                    <option value="date">Date submitted</option><option value="applicant">Applicant</option><option value="amount">Amount</option><option value="status">Status</option><option value="type">Aid type</option>
+                </select>
+            </div>
+            <div class="filter-field">
+                <label>Direction</label>
+                <select id="filterDirection"><option value="DESC">Newest / descending</option><option value="ASC">Oldest / ascending</option></select>
             </div>
         </div>
         <div class="export-actions">
@@ -432,36 +449,46 @@ function selectReport(type) {
     document.querySelectorAll('.export-card').forEach(c => c.classList.remove('active'));
     document.querySelector('.export-card[data-type="'+type+'"]').classList.add('active');
     // Show/hide filters based on type
-    document.getElementById('filterCard').style.display = type === 'applications' ? 'block' : 'none';
+    document.getElementById('filterCard').style.display = 'block';
     lucide.createIcons();
 }
 
-function buildFilterParams() {
+function buildFilterParams(forPrint = false) {
+    const search   = document.getElementById('filterSearch').value;
     const status   = document.getElementById('filterStatus').value;
     const type     = document.getElementById('filterType').value;
     const barangay = document.getElementById('filterBarangay').value;
     const from     = document.getElementById('filterFrom').value;
     const to       = document.getElementById('filterTo').value;
+    const amountMin = document.getElementById('filterAmountMin').value;
+    const amountMax = document.getElementById('filterAmountMax').value;
+    const sort = document.getElementById('filterSort').value;
+    const direction = document.getElementById('filterDirection').value;
     let p = '';
+    if (search)   p += '&search=' + encodeURIComponent(search);
     if (status)   p += '&status='   + encodeURIComponent(status);
-    if (type)     p += '&type='     + encodeURIComponent(type);
+    if (type)     p += (forPrint ? '&type_filter=' : '&type=') + encodeURIComponent(type);
     if (barangay) p += '&barangay=' + encodeURIComponent(barangay);
     if (from)     p += '&date_from=' + encodeURIComponent(from);
     if (to)       p += '&date_to='   + encodeURIComponent(to);
+    if (amountMin) p += '&amount_min=' + encodeURIComponent(amountMin);
+    if (amountMax) p += '&amount_max=' + encodeURIComponent(amountMax);
+    if (sort) p += '&sort=' + encodeURIComponent(sort);
+    if (direction) p += '&dir=' + encodeURIComponent(direction);
     return p;
 }
 
 function openPrintReport() {
     let url = 'print_report.php?type=' + selectedReport;
-    if (selectedReport === 'applications' || selectedReport === 'beneficiaries') {
-        url += buildFilterParams();
+    if (selectedReport === 'applications' || selectedReport === 'beneficiaries' || selectedReport === 'summary') {
+        url += buildFilterParams(true);
     }
     window.open(url, '_blank');
 }
 
 function downloadReport() {
     let url = '?export=' + selectedReport;
-    if (selectedReport === 'applications' || selectedReport === 'beneficiaries') {
+    if (selectedReport === 'applications' || selectedReport === 'beneficiaries' || selectedReport === 'summary') {
         url += buildFilterParams();
     }
     window.location.href = url;
@@ -473,6 +500,11 @@ function resetFilters() {
     document.getElementById('filterBarangay').value = '';
     document.getElementById('filterFrom').value = '';
     document.getElementById('filterTo').value = '';
+    document.getElementById('filterSearch').value = '';
+    document.getElementById('filterAmountMin').value = '';
+    document.getElementById('filterAmountMax').value = '';
+    document.getElementById('filterSort').value = 'date';
+    document.getElementById('filterDirection').value = 'DESC';
 }
 
 // Auto-select first report type

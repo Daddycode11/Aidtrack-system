@@ -1,6 +1,8 @@
 <?php
 // admin/super_admin.php — Super Admin Panel
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
+require_once __DIR__ . '/../helpers/mailer.php';
 require_super_admin();
 
 $admin_id = $_SESSION['user']['id'];
@@ -14,47 +16,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_admin') {
         $name  = trim($_POST['name'] ?? '');
         $phone = trim($_POST['phone'] ?? '');
+        $email = trim($_POST['email'] ?? '');
         $pass  = $_POST['password'] ?? '';
         $role  = $_POST['role'] ?? 'admin';
         if (!in_array($role, ['admin', 'super_admin'])) $role = 'admin';
 
-        if ($name && $phone && strlen($pass) >= 8) {
-            $stmt = $mysqli->prepare("SELECT id FROM users WHERE phone=?");
-            $stmt->bind_param('s', $phone);
-            $stmt->execute();
-            if ($stmt->get_result()->num_rows === 0) {
-                $stmt->close();
-                $hash = password_hash($pass, PASSWORD_DEFAULT);
-                $stmt = $mysqli->prepare("INSERT INTO users (name, phone, password_hash, role) VALUES (?,?,?,?)");
-                $stmt->bind_param('ssss', $name, $phone, $hash, $role);
-                $stmt->execute();
-                $new_id = (int)$mysqli->insert_id;
-                $stmt->close();
-                log_audit($mysqli, 'create_user', 'user', $new_id, "Created $role account: $name ($phone)");
-                header('Location: super_admin.php?toast=added'); exit;
-            } else {
-                $stmt->close();
-                header('Location: super_admin.php?toast=phone_taken'); exit;
-            }
+        if (!$name || !preg_match('/^[0-9+\-\s]{7,20}$/', $phone) || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($pass) < 8) {
+            header('Location: super_admin.php?toast=invalid'); exit;
         }
+
+        $stmt = $mysqli->prepare("SELECT id FROM users WHERE phone=? OR email=? LIMIT 1");
+        $stmt->bind_param('ss', $phone, $email);
+        $stmt->execute();
+        if ($stmt->get_result()->num_rows === 0) {
+            $stmt->close();
+            $hash = password_hash($pass, PASSWORD_DEFAULT);
+            $stmt = $mysqli->prepare("INSERT INTO users (name, phone, email, email_verified, password_hash, role) VALUES (?, ?, ?, 0, ?, ?)");
+            $stmt->bind_param('sssss', $name, $phone, $email, $hash, $role);
+            $stmt->execute();
+            $new_id = (int)$mysqli->insert_id;
+            $stmt->close();
+            $sent = send_verification_email($mysqli, $new_id, $email, $name);
+            log_audit($mysqli, 'create_user', 'user', $new_id, "Created $role account: $name ($email)");
+            header('Location: super_admin.php?toast=' . ($sent ? 'added' : 'added_mail_failed')); exit;
+        }
+        $stmt->close();
+        header('Location: super_admin.php?toast=account_taken'); exit;
     }
 
     // Change Role
     if ($action === 'change_role') {
         $uid      = (int)($_POST['user_id'] ?? 0);
         $new_role = $_POST['new_role'] ?? '';
+        $email    = trim($_POST['email'] ?? '');
         if ($uid && $uid !== $admin_id && in_array($new_role, ['client', 'admin', 'super_admin'])) {
-            $old_stmt = $mysqli->prepare("SELECT role, name FROM users WHERE id=?");
+            $old_stmt = $mysqli->prepare("SELECT role, name, email FROM users WHERE id=?");
             $old_stmt->bind_param('i', $uid); $old_stmt->execute();
             $old = $old_stmt->get_result()->fetch_assoc(); $old_stmt->close();
 
-            $stmt = $mysqli->prepare("UPDATE users SET role=? WHERE id=?");
-            $stmt->bind_param('si', $new_role, $uid);
-            $stmt->execute();
-            $stmt->close();
+            if (!$old) { header('Location: super_admin.php'); exit; }
+            if (in_array($new_role, ['admin', 'super_admin'], true)) {
+                if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    header('Location: super_admin.php?toast=invalid'); exit;
+                }
+                $email_check = $mysqli->prepare('SELECT id FROM users WHERE email=? AND id!=? LIMIT 1');
+                $email_check->bind_param('si', $email, $uid);
+                $email_check->execute();
+                $taken = (bool)$email_check->get_result()->fetch_assoc();
+                $email_check->close();
+                if ($taken) { header('Location: super_admin.php?toast=account_taken'); exit; }
+
+                $emailChanged = $email !== (string)($old['email'] ?? '');
+                $promoted = !in_array($old['role'], ['admin', 'super_admin'], true);
+                $sendVerification = $emailChanged || $promoted;
+                if ($sendVerification) {
+                    $unverified = 0;
+                    $stmt = $mysqli->prepare('UPDATE users SET role=?, email=?, email_verified=?, verification_token_hash=NULL, verification_expires=NULL WHERE id=?');
+                    $stmt->bind_param('ssii', $new_role, $email, $unverified, $uid);
+                } else {
+                    $stmt = $mysqli->prepare('UPDATE users SET role=?, email=? WHERE id=?');
+                    $stmt->bind_param('ssi', $new_role, $email, $uid);
+                }
+                $stmt->execute();
+                $stmt->close();
+                $sent = !$sendVerification || send_verification_email($mysqli, $uid, $email, $old['name']);
+            } else {
+                $sendVerification = false;
+                $stmt = $mysqli->prepare('UPDATE users SET role=? WHERE id=?');
+                $stmt->bind_param('si', $new_role, $uid);
+                $stmt->execute();
+                $stmt->close();
+                $sent = true;
+            }
             log_audit($mysqli, 'change_role', 'user', $uid,
                 "Changed role of {$old['name']} from {$old['role']} to $new_role");
-            header('Location: super_admin.php?toast=role_changed'); exit;
+            header('Location: super_admin.php?toast=' . ($sent ? 'role_changed' : 'verification_failed')); exit;
         }
     }
 
@@ -78,27 +114,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// --- Fetch Users ---
-$users = $mysqli->query("SELECT * FROM users ORDER BY role DESC, name ASC")->fetch_all(MYSQLI_ASSOC);
+$roleOptions = ['client'=>'Client','admin'=>'Admin','super_admin'=>'Super Admin'];
+$overview = table_filter_query($mysqli, [
+    'from_sql'=>'FROM users',
+    'select_sql'=>'id, name, phone, email, email_verified, role, created_at, barangay',
+    'filters'=>[
+        'search'=>['kind'=>'search','label'=>'Keyword','placeholder'=>'Name, email or phone','columns'=>['name','email','phone']],
+        'role'=>['kind'=>'select','label'=>'Role','options'=>$roleOptions,'sql'=>'role'],
+        'verified'=>['kind'=>'select','label'=>'Email verified','options'=>['yes'=>'Verified','no'=>'Not verified'],'expressions'=>['yes'=>"role IN ('admin','super_admin') AND email_verified=1",'no'=>"role IN ('admin','super_admin') AND email_verified=0"]],
+        'date_from'=>['kind'=>'date','label'=>'Created from','sql'=>'created_at','operator'=>'>='],
+        'date_to'=>['kind'=>'date','label'=>'Created to','sql'=>'created_at','operator'=>'<','inclusive_end'=>true],
+    ],
+    'sort'=>['name'=>'name','email'=>'email','role'=>'role','created'=>'created_at'],
+    'default_sort'=>'role','default_dir'=>'ASC','per_page'=>10,
+]);
+$users = $overview['rows'];
 
 // --- Stats ---
-$total_users  = count($users);
-$admins       = count(array_filter($users, fn($u) => $u['role'] === 'admin'));
-$super_admins = count(array_filter($users, fn($u) => $u['role'] === 'super_admin'));
-$clients      = count(array_filter($users, fn($u) => $u['role'] === 'client'));
+$roleStats = $mysqli->query('SELECT role, COUNT(*) AS total FROM users GROUP BY role')->fetch_all(MYSQLI_ASSOC);
+$allRoleCounts = [];
+foreach ($roleStats as $roleStat) $allRoleCounts[$roleStat['role']] = (int)$roleStat['total'];
+$total_users  = array_sum($allRoleCounts);
+$admins       = $allRoleCounts['admin'] ?? 0;
+$super_admins = $allRoleCounts['super_admin'] ?? 0;
+$clients      = $allRoleCounts['client'] ?? 0;
 $total_apps   = get_count('applications');
 $total_msgs   = get_count('messages');
 
-// --- Recent Actions ---
-$recent_actions = [];
-$stmt = $mysqli->prepare("
-    SELECT aa.*, adm.name AS admin_name, app.type AS app_type
-    FROM admin_actions aa
-    LEFT JOIN users adm ON aa.admin_id = adm.id
-    LEFT JOIN applications app ON aa.application_id = app.id
-    ORDER BY aa.created_at DESC LIMIT 15
-");
-if ($stmt) { $stmt->execute(); $recent_actions = $stmt->get_result()->fetch_all(MYSQLI_ASSOC); $stmt->close(); }
+$activityTable = table_filter_query($mysqli, [
+    'from_sql'=>'FROM admin_actions aa LEFT JOIN users adm ON aa.admin_id=adm.id LEFT JOIN applications app ON aa.application_id=app.id',
+    'select_sql'=>'aa.id, aa.action, aa.details, aa.created_at, adm.name AS admin_name, app.type AS app_type',
+    'filters'=>[],
+    'sort'=>['actor'=>'adm.name','action'=>'aa.action','type'=>'app.type','date'=>'aa.created_at'],
+    'default_sort'=>'date','per_page'=>8,
+    'param_names'=>['page'=>'activity_page','per_page'=>'activity_per_page','sort'=>'activity_sort','dir'=>'activity_dir'],
+]);
+$recent_actions = $activityTable['rows'];
 
 // Page config
 $active_page   = 'super_admin';
@@ -147,12 +198,17 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
     $t = $_GET['toast'];
     $is_err = $t === 'phone_taken';
     $tmsg = match($t) {
-        'added' => 'Admin user created successfully.',
+        'added' => 'Admin created. A verification email has been sent.',
+        'added_mail_failed' => 'Admin created, but the verification email could not be sent. Check SMTP settings and resend the link.',
         'role_changed' => 'User role updated.',
         'deleted' => 'User deleted.',
+        'verification_failed' => 'Role updated, but the verification email could not be sent. Check SMTP settings and resend the link.',
+        'account_taken' => 'Phone number or email address already in use.',
         'phone_taken' => 'Phone number already in use.',
+        'invalid' => 'Enter a name, valid phone and email, and a password of at least 8 characters.',
         default => ''
     };
+    $is_err = in_array($t, ['added_mail_failed', 'verification_failed', 'account_taken', 'phone_taken', 'invalid'], true);
 ?>
 <div class="toast <?= $is_err ? 'toast-err' : 'toast-ok' ?>">
     <i data-lucide="<?= $is_err ? 'alert-circle' : 'check-circle' ?>" style="width:16px;height:16px"></i> <?= $tmsg ?>
@@ -192,14 +248,15 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="card-title">
                     <div class="card-title-icon cti-blue"><i data-lucide="users" style="width:14px;height:14px"></i></div>
                     User Management
-                    <span class="count-pill"><?= $total_users ?></span>
+                    <span class="count-pill"><?= $overview['total'] ?></span>
                 </div>
             </div>
+            <?php $table = $overview; include 'partials/filter_bar.php'; $table = $overview; ?>
             <div class="card-body no-pad">
                 <div class="tbl-wrap">
-                    <table data-paginate="10">
+                    <table>
                         <thead>
-                            <tr><th>User</th><th>Phone</th><th>Role</th><th>Joined</th><th>Actions</th></tr>
+                            <tr><th><?= table_sort_link($overview, 'name', 'User') ?></th><th><?= table_sort_link($overview, 'email', 'Email') ?></th><th>Phone</th><th><?= table_sort_link($overview, 'role', 'Role') ?></th><th><?= table_sort_link($overview, 'created', 'Joined') ?></th><th>Actions</th></tr>
                         </thead>
                         <tbody>
                         <?php foreach ($users as $i => $u):
@@ -210,28 +267,31 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         <tr>
                             <td>
                                 <div style="display:flex;align-items:center;gap:8px;">
-                                    <div class="row-avatar" style="background:<?= $col ?>;width:28px;height:28px;font-size:.6rem;"><?= $init ?></div>
+                                    <div class="row-avatar" style="background:<?= $col ?>;width:28px;height:28px;font-size:.6rem;"><?= htmlspecialchars($init, ENT_QUOTES, 'UTF-8') ?></div>
                                     <div>
                                         <div style="font-weight:700;font-size:.82rem;"><?= htmlspecialchars($u['name']) ?></div>
                                         <div style="font-size:.66rem;color:var(--muted);"><?= htmlspecialchars($u['barangay'] ?? '') ?></div>
                                     </div>
                                 </div>
                             </td>
-                            <td style="font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['phone']) ?></td>
-                            <td><span class="role-badge rb-<?= $u['role'] ?>"><?= str_replace('_',' ',ucfirst($u['role'])) ?></span></td>
+                            <td style="font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['email'] ?? '—', ENT_QUOTES, 'UTF-8') ?></td>
+                            <td style="font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($u['phone'], ENT_QUOTES, 'UTF-8') ?></td>
+                            <td><span class="role-badge rb-<?= htmlspecialchars($u['role'], ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars(str_replace('_',' ',ucfirst($u['role'])), ENT_QUOTES, 'UTF-8') ?></span></td>
                             <td style="font-size:.76rem;color:var(--muted);white-space:nowrap;"><?= date('M d, Y', strtotime($u['created_at'])) ?></td>
                             <td>
                                 <?php if (!$is_self): ?>
                                 <div style="display:flex;gap:4px;align-items:center;">
-                                    <form method="post" style="display:flex;gap:4px;align-items:center;" onsubmit="return confirm('Change role for <?= htmlspecialchars(addslashes($u['name'])) ?>?')">
+                                    <form method="post" style="display:flex;gap:4px;align-items:center;" onsubmit="return confirm('Save role and email for <?= htmlspecialchars(addslashes($u['name'])) ?>?')">
                                         <?= csrf_field() ?>
                                         <input type="hidden" name="action" value="change_role">
                                         <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
-                                        <select name="new_role" class="role-select" onchange="this.form.submit()">
+                                        <input type="email" name="email" value="<?= htmlspecialchars($u['email'] ?? '', ENT_QUOTES, 'UTF-8') ?>" placeholder="Email for admin" aria-label="Email address for <?= htmlspecialchars($u['name'], ENT_QUOTES, 'UTF-8') ?>" style="width:150px;font-size:.72rem;padding:5px;border:1px solid var(--border);border-radius:6px;">
+                                        <select name="new_role" class="role-select">
                                             <option value="client"      <?= $u['role']==='client'     ?'selected':'' ?>>Client</option>
                                             <option value="admin"       <?= $u['role']==='admin'      ?'selected':'' ?>>Admin</option>
                                             <option value="super_admin" <?= $u['role']==='super_admin'?'selected':'' ?>>Super Admin</option>
                                         </select>
+                                        <button type="submit" class="tbl-action ta-view" title="Save role and email"><i data-lucide="save" style="width:11px;height:11px"></i></button>
                                     </form>
                                     <?php if ($u['role'] !== 'super_admin'): ?>
                                     <form method="post" style="display:inline;" onsubmit="return confirm('Delete <?= htmlspecialchars(addslashes($u['name'])) ?> permanently?')">
@@ -253,6 +313,7 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         </tbody>
                     </table>
                 </div>
+                <?php $table = $overview; include 'partials/table_pager.php'; ?>
             </div>
         </div>
 
@@ -270,8 +331,8 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="empty-state"><div class="empty-icon"><i data-lucide="activity" style="width:20px;height:20px"></i></div><div class="empty-text">No activity yet.</div></div>
                 <?php else: ?>
                 <div class="tbl-wrap">
-                    <table data-paginate="8">
-                        <thead><tr><th>Admin</th><th>Action</th><th>Type</th><th>Date</th></tr></thead>
+                    <table>
+                        <thead><tr><th><?= table_sort_link($activityTable, 'actor', 'Admin') ?></th><th><?= table_sort_link($activityTable, 'action', 'Action') ?></th><th><?= table_sort_link($activityTable, 'type', 'Type') ?></th><th><?= table_sort_link($activityTable, 'date', 'Date') ?></th></tr></thead>
                         <tbody>
                         <?php foreach ($recent_actions as $act): ?>
                         <tr>
@@ -288,6 +349,7 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         </tbody>
                     </table>
                 </div>
+                <?php $table = $activityTable; include 'partials/table_pager.php'; ?>
                 <?php endif; ?>
             </div>
         </div>
@@ -316,6 +378,10 @@ $colors = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="form-group">
                     <label>Phone Number</label>
                     <input type="text" name="phone" placeholder="09XX XXX XXXX" required>
+                </div>
+                <div class="form-group">
+                    <label>Email Address</label>
+                    <input type="email" name="email" placeholder="admin@gmail.com" required>
                 </div>
                 <div class="form-group">
                     <label>Password</label>

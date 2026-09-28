@@ -2,6 +2,7 @@
 // admin/applications.php
 require_once __DIR__ . '/../helpers.php';
 require_once __DIR__ . '/../helpers/notify.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
 
 $admin_id   = $_SESSION['user']['id'] ?? 0;
@@ -173,37 +174,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'], $_POST['id'
 // ─────────────────────────────────────────────────────────────
 // Filters & data
 // ─────────────────────────────────────────────────────────────
-$filter_status = $_GET['status'] ?? '';
-$filter_type   = $_GET['type']   ?? '';
-$filter_client = $_GET['client'] ?? '';
+$barangay_options = array_column($mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC), 'barangay');
+$table = table_filter_query($mysqli, [
+    'from_sql' => 'FROM applications a JOIN users u ON a.user_id = u.id',
+    'select_sql' => 'a.id, a.type, a.amount_requested, a.amount_granted, a.amount_released, a.notes, a.status, a.date_of_request, a.created_at, u.name AS client_name, u.phone, u.email, u.barangay',
+    'filters' => [
+        'search' => ['kind' => 'search', 'label' => 'Keyword', 'placeholder' => 'Name, phone, email or ID', 'columns' => ['u.name', 'u.phone', 'u.email', 'CAST(a.id AS CHAR)']],
+        'status' => ['kind' => 'select', 'label' => 'Status', 'options' => ['pending'=>'Pending','approved'=>'Approved','rejected'=>'Rejected','cancelled'=>'Cancelled','released'=>'Released'], 'sql' => 'a.status', 'expressions' => ['released' => 'a.amount_released > 0']],
+        'type' => ['kind' => 'select', 'label' => 'Aid type', 'options' => ['medical'=>'Medical','burial'=>'Burial','educational'=>'Educational','livelihood'=>'Livelihood','emergency'=>'Emergency'], 'sql' => 'a.type'],
+        'barangay' => ['kind' => 'select', 'label' => 'Barangay', 'options' => array_combine($barangay_options, $barangay_options) ?: [], 'sql' => 'u.barangay'],
+        'date_from' => ['kind' => 'date', 'label' => 'Submitted from', 'sql' => 'a.created_at', 'operator' => '>='],
+        'date_to' => ['kind' => 'date', 'label' => 'Submitted to', 'sql' => 'a.created_at', 'operator' => '<', 'inclusive_end' => true],
+        'amount_min' => ['kind' => 'number', 'label' => 'Amount from', 'sql' => 'a.amount_requested', 'operator' => '>='],
+        'amount_max' => ['kind' => 'number', 'label' => 'Amount to', 'sql' => 'a.amount_requested', 'operator' => '<='],
+    ],
+    'sort' => ['id'=>'a.id', 'client'=>'u.name', 'barangay'=>'u.barangay', 'type'=>'a.type', 'amount'=>'a.amount_requested', 'date'=>'a.created_at', 'status'=>'a.status'],
+    'default_sort' => 'date',
+    'per_page' => 25,
+]);
+$applications = $table['rows'];
+$filter_status = $table['filters']['status'];
+$filter_type = $table['filters']['type'];
+$filter_client = $table['filters']['search'];
+$reportParams = $_GET;
+unset($reportParams['page'], $reportParams['per_page']);
+$applicationExportUrl = 'export_reports.php?' . http_build_query(array_merge($reportParams, ['export'=>'applications']));
+$printParams = $reportParams;
+if (isset($printParams['type'])) {
+    $printParams['type_filter'] = $printParams['type'];
+    unset($printParams['type']);
+}
+$applicationPrintUrl = 'print_report.php?' . http_build_query(array_merge(['type'=>'applications'], $printParams));
 
-$where = []; $params = []; $types = '';
-if ($filter_status) { $where[] = 'a.status=?';   $params[] = $filter_status; $types .= 's'; }
-if ($filter_type)   { $where[] = 'a.type=?';      $params[] = $filter_type;   $types .= 's'; }
-if ($filter_client) { $where[] = 'u.name LIKE ?'; $params[] = "%$filter_client%"; $types .= 's'; }
-$where_sql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
-
-$stmt = $mysqli->prepare("
-    SELECT a.id, a.type, a.amount_requested, a.amount_granted, a.amount_released,
-           a.notes, a.status, a.date_of_request,
-           u.name AS client_name, u.barangay
-    FROM applications a JOIN users u ON a.user_id = u.id
-    $where_sql ORDER BY a.created_at DESC
-");
-if ($params) $stmt->bind_param($types, ...$params);
-$stmt->execute();
-$applications = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
-
-$doc_res = $mysqli->query("
-    SELECT d.id, d.application_id, d.original_name, d.filename, d.uploaded_at,
-           u.name AS client_name, a.status AS application_status
-    FROM documents d
-    JOIN applications a ON d.application_id = a.id
-    JOIN users u ON a.user_id = u.id
-    ORDER BY d.uploaded_at DESC
-");
-$documents = $doc_res->fetch_all(MYSQLI_ASSOC);
+$documentsTable = table_filter_query($mysqli, [
+    'from_sql'=>'FROM documents d JOIN applications a ON d.application_id=a.id JOIN users u ON a.user_id=u.id',
+    'select_sql'=>'d.id, d.application_id, d.original_name, d.filename, d.uploaded_at, u.name AS client_name, a.status AS application_status',
+    'filters'=>[],
+    'sort'=>['applicant'=>'u.name','application'=>'d.application_id','document'=>'d.original_name','uploaded'=>'d.uploaded_at','status'=>'a.status'],
+    'default_sort'=>'uploaded','per_page'=>10,
+    'param_names'=>['page'=>'documents_page','per_page'=>'documents_per_page','sort'=>'documents_sort','dir'=>'documents_dir'],
+]);
+$documents = $documentsTable['rows'];
 
 $pending_aids         = (int)($mysqli->query("SELECT COUNT(*) FROM applications WHERE status='pending'")->fetch_row()[0] ?? 0);
 $pending_sa_approvals = get_pending_approvals_count($mysqli);
@@ -283,12 +294,14 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="page-sub">Review, approve, and manage all submitted assistance requests.</div>
             </div>
             <div class="page-actions">
-                <span class="count-pill"><?= count($applications) ?> total</span>
+                <span class="count-pill"><?= $table['total'] ?> total</span>
                 <?php if ($is_sa && $pending_sa_approvals > 0): ?>
                 <a href="super_admin_approvals.php" class="btn btn-sm" style="background:#f5f3ff;color:#7c3aed;border:1px solid rgba(124,58,237,.2);">
                     <i data-lucide="shield-alert" style="width:13px;height:13px"></i> SA Queue (<?= $pending_sa_approvals ?>)
                 </a>
                 <?php endif; ?>
+                <a href="<?= htmlspecialchars($applicationExportUrl, ENT_QUOTES, 'UTF-8') ?>" class="btn btn-outline btn-sm"><i data-lucide="download" style="width:13px;height:13px"></i> Export CSV</a>
+                <a href="<?= htmlspecialchars($applicationPrintUrl, ENT_QUOTES, 'UTF-8') ?>" target="_blank" class="btn btn-outline btn-sm"><i data-lucide="printer" style="width:13px;height:13px"></i> Print</a>
                 <a href="applications.php" class="btn btn-outline btn-sm">
                     <i data-lucide="refresh-cw" style="width:13px;height:13px"></i> Refresh
                 </a>
@@ -308,41 +321,11 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             <div class="card-title">
                 <div class="card-title-icon cti-blue"><i data-lucide="clipboard-list" style="width:14px;height:14px"></i></div>
                 Applications Queue
-                <span class="count-pill"><?= count($applications) ?></span>
+                <span class="count-pill"><?= $table['total'] ?></span>
             </div>
         </div>
 
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('all',this)">All</button>
-            <button class="tab" onclick="switchTab('pending',this)">
-                Pending <?php if ($pending_aids > 0): ?><span class="nav-badge" style="position:static;margin-left:6px;"><?= $pending_aids ?></span><?php endif; ?>
-            </button>
-            <button class="tab" onclick="switchTab('approved',this)">Approved</button>
-            <button class="tab" onclick="switchTab('rejected',this)">Rejected</button>
-        </div>
-
-        <form method="get" class="filter-row">
-            <i data-lucide="search" style="width:15px;height:15px;color:var(--muted)"></i>
-            <input type="text" name="client" placeholder="Search by name…" value="<?= htmlspecialchars($filter_client) ?>">
-            <select name="type">
-                <option value="">All Types</option>
-                <option value="medical"     <?= $filter_type==='medical'    ?'selected':''?>>Medical</option>
-                <option value="burial"      <?= $filter_type==='burial'     ?'selected':''?>>Burial</option>
-            </select>
-            <select name="status">
-                <option value="">All Status</option>
-                <option value="pending"  <?= $filter_status==='pending' ?'selected':''?>>Pending</option>
-                <option value="approved" <?= $filter_status==='approved'?'selected':''?>>Approved</option>
-                <option value="rejected" <?= $filter_status==='rejected'?'selected':''?>>Rejected</option>
-            </select>
-            <button type="submit" class="btn btn-primary btn-sm"><i data-lucide="filter" style="width:13px;height:13px"></i> Filter</button>
-            <div class="filter-spacer"></div>
-            <?php if ($filter_client || $filter_type || $filter_status): ?>
-            <a href="applications.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
-                <i data-lucide="x" style="width:13px;height:13px;vertical-align:middle"></i> Clear
-            </a>
-            <?php endif; ?>
-        </form>
+        <?php include 'partials/filter_bar.php'; ?>
 
         <div class="card-body no-pad">
             <?php if (empty($applications)): ?>
@@ -352,12 +335,12 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table id="applicationsTable" data-paginate="10">
+                <table id="applicationsTable">
                     <thead>
                         <tr>
                             <th style="width:30px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll(this)"></th>
-                            <th>#</th><th>Applicant</th><th>Barangay</th><th>Type</th>
-                            <th>Amount</th><th>Notes</th><th>Date</th><th>Status</th><th>Actions</th>
+                            <th><?= table_sort_link($table, 'id', '#') ?></th><th><?= table_sort_link($table, 'client', 'Applicant') ?></th><th><?= table_sort_link($table, 'barangay', 'Barangay') ?></th><th><?= table_sort_link($table, 'type', 'Type') ?></th>
+                            <th><?= table_sort_link($table, 'amount', 'Amount') ?></th><th>Notes</th><th><?= table_sort_link($table, 'date', 'Date submitted') ?></th><th><?= table_sort_link($table, 'status', 'Status') ?></th><th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -368,7 +351,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         $init = implode('', array_map(fn($w) => strtoupper($w[0]), array_slice(explode(' ', $app['client_name']), 0, 2)));
                         $needs_sa = !$is_sa && floatval($app['amount_requested']) >= SA_APPROVAL_AMOUNT_THRESHOLD;
                     ?>
-                    <tr data-status="<?= $s ?>">
+                    <tr>
                         <td><input type="checkbox" class="row-check" value="<?= $app['id'] ?>" data-status="<?= $s ?>" onchange="updateBatchBar()"></td>
                         <td style="color:var(--muted);font-size:.75rem;"><a href="view_application.php?id=<?= $app['id'] ?>" style="color:var(--brand);font-weight:700;"><?= $app['id'] ?></a></td>
                         <td>
@@ -422,6 +405,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                     </tbody>
                 </table>
             </div>
+            <?php include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>
@@ -442,9 +426,9 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table data-paginate="10">
+                <table>
                     <thead>
-                        <tr><th>Applicant</th><th>App. ID</th><th>Document</th><th>Uploaded</th><th>App. Status</th><th>Actions</th></tr>
+                        <tr><th><?= table_sort_link($documentsTable, 'applicant', 'Applicant') ?></th><th><?= table_sort_link($documentsTable, 'application', 'App. ID') ?></th><th><?= table_sort_link($documentsTable, 'document', 'Document') ?></th><th><?= table_sort_link($documentsTable, 'uploaded', 'Uploaded') ?></th><th><?= table_sort_link($documentsTable, 'status', 'App. Status') ?></th><th>Actions</th></tr>
                     </thead>
                     <tbody>
                     <?php foreach ($documents as $i => $doc):
@@ -484,6 +468,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                     </tbody>
                 </table>
             </div>
+            <?php $table = $documentsTable; include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>

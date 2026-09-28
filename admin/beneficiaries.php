@@ -1,42 +1,36 @@
 <?php
 // admin/beneficiaries.php
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_admin();
 
-// --- Filter ---
-$search  = $_GET['search']   ?? '';
-$f_town  = $_GET['barangay'] ?? ''; // note: kept as 'barangay' GET/column name to avoid breaking existing DB schema/links
-
-$where = []; $params = []; $types = '';
-if ($search) { $where[] = '(u.name LIKE ? OR u.phone LIKE ?)'; $params[] = "%$search%"; $params[] = "%$search%"; $types .= 'ss'; }
-if ($f_town) { $where[] = 'u.barangay = ?'; $params[] = $f_town; $types .= 's'; }
-$where_sql = $where ? 'WHERE '.implode(' AND ', $where) : '';
-
-// Beneficiaries query
-$beneficiaries = [];
-$stmt = $mysqli->prepare("
-    SELECT u.id, u.name, u.phone, u.barangay,
-           COUNT(a.id)                                   AS total_aids,
-           SUM(a.status='approved')                      AS approved_aids,
-           MAX(a.created_at)                             AS last_request
-    FROM users u
-    LEFT JOIN applications a ON a.user_id = u.id
-    WHERE u.role = 'client'" . ($where ? ' AND ' . implode(' AND ', $where) : '') . "
-    GROUP BY u.id ORDER BY u.name ASC
-");
-if ($params) $stmt->bind_param($types, ...$params);
-$stmt->execute();
-$beneficiaries = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt->close();
+$town_list = array_column($mysqli->query("SELECT DISTINCT barangay FROM users WHERE barangay IS NOT NULL AND barangay <> '' ORDER BY barangay")->fetch_all(MYSQLI_ASSOC), 'barangay');
+$table = table_filter_query($mysqli, [
+    'from_sql' => 'FROM users u LEFT JOIN applications a ON a.user_id = u.id',
+    'base_where' => "u.role = 'client'",
+    'count_expression' => 'COUNT(DISTINCT u.id)',
+    'select_sql' => 'u.id, u.name, u.phone, u.barangay, u.status, u.created_at, COUNT(a.id) AS total_aids, COALESCE(SUM(a.status = \'approved\'), 0) AS approved_aids, MAX(a.created_at) AS last_request',
+    'group_by' => 'GROUP BY u.id',
+    'filters' => [
+        'search' => ['kind'=>'search', 'label'=>'Keyword', 'placeholder'=>'Name or phone', 'columns'=>['u.name','u.phone']],
+        'barangay' => ['kind'=>'select','label'=>'Barangay','options'=>array_combine($town_list, $town_list) ?: [],'sql'=>'u.barangay'],
+        'account_status' => ['kind'=>'select','label'=>'Account status','options'=>['active'=>'Active','suspended'=>'Suspended'],'sql'=>'u.status'],
+        'date_from' => ['kind'=>'date','label'=>'Registered from','sql'=>'u.created_at','operator'=>'>='],
+        'date_to' => ['kind'=>'date','label'=>'Registered to','sql'=>'u.created_at','operator'=>'<','inclusive_end'=>true],
+        'applications' => ['kind'=>'select','label'=>'Applications','options'=>['has'=>'Has applications','none'=>'Has no applications'],'expressions'=>['has'=>'EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id = u.id)','none'=>'NOT EXISTS (SELECT 1 FROM applications ax WHERE ax.user_id = u.id)']],
+    ],
+    'sort' => ['name'=>'u.name','phone'=>'u.phone','barangay'=>'u.barangay','status'=>'u.status','total'=>'total_aids','approved'=>'approved_aids','registered'=>'u.created_at'],
+    'default_sort'=>'name','default_dir'=>'ASC','per_page'=>25,
+]);
+$beneficiaries = $table['rows'];
+$search = $table['filters']['search'];
+$f_town = $table['filters']['barangay'];
+$beneficiaryParams = $_GET;
+unset($beneficiaryParams['page'], $beneficiaryParams['per_page']);
+$beneficiaryExportUrl = 'export_reports.php?' . http_build_query(array_merge($beneficiaryParams, ['export'=>'beneficiaries']));
+$beneficiaryPrintUrl = 'print_report.php?' . http_build_query(array_merge(['type'=>'beneficiaries'], $beneficiaryParams));
 
 // --- Static Town/Bayan list (hindi na barangay ng Calintaan lang, mga karatig-bayan) ---
-$town_list = [
-    'Calintaan',
-    'Magsaysay',
-    'Rizal',
-    'San Jose',
-];
-sort($town_list);
 
 // Partials
 $active_page   = 'beneficiaries';
@@ -80,10 +74,11 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                 <div class="page-sub">All residents registered in the AIDTRACK system as aid applicants.</div>
             </div>
             <div class="page-actions">
-                <span class="count-pill"><?= count($beneficiaries) ?> total</span>
-                <a href="#" class="btn btn-primary btn-sm">
+                <span class="count-pill"><?= $table['total'] ?> total</span>
+                <a href="<?= htmlspecialchars($beneficiaryExportUrl, ENT_QUOTES, 'UTF-8') ?>" class="btn btn-primary btn-sm">
                     <i data-lucide="file-down" style="width:13px;height:13px"></i> Export
                 </a>
+                <a href="<?= htmlspecialchars($beneficiaryPrintUrl, ENT_QUOTES, 'UTF-8') ?>" target="_blank" class="btn btn-outline btn-sm"><i data-lucide="printer" style="width:13px;height:13px"></i> Print</a>
             </div>
         </div>
     </div>
@@ -93,34 +88,12 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             <div class="card-title">
                 <div class="card-title-icon cti-blue"><i data-lucide="users" style="width:14px;height:14px"></i></div>
                 Beneficiary List
-                <span class="count-pill"><?= count($beneficiaries) ?></span>
+                <span class="count-pill"><?= $table['total'] ?></span>
             </div>
         </div>
 
         <!-- Filter -->
-        <form method="get" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:13px 18px;border-bottom:1px solid var(--border);background:var(--bg);">
-            <i data-lucide="search" style="width:14px;height:14px;color:var(--muted)"></i>
-            <input type="text" name="search" placeholder="Search by name or phone…"
-                   value="<?= htmlspecialchars($search) ?>"
-                   style="flex:1;min-width:160px;font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
-            <select name="barangay"
-                    style="font-family:inherit;font-size:.8rem;color:var(--navy);background:var(--white);border:1.5px solid var(--border);border-radius:8px;padding:7px 12px;outline:none;">
-                <option value="">All Towns</option>
-                <?php foreach ($town_list as $t): ?>
-                <option value="<?= htmlspecialchars($t) ?>" <?= $f_town===$t?'selected':''?>>
-                    <?= htmlspecialchars($t) ?>
-                </option>
-                <?php endforeach; ?>
-            </select>
-            <button type="submit" class="btn btn-primary btn-sm">
-                <i data-lucide="filter" style="width:13px;height:13px"></i> Filter
-            </button>
-            <?php if ($search || $f_town): ?>
-            <a href="beneficiaries.php" style="font-size:.76rem;font-weight:600;color:var(--muted);">
-                <i data-lucide="x" style="width:12px;height:12px;vertical-align:middle"></i> Clear
-            </a>
-            <?php endif; ?>
-        </form>
+        <?php include 'partials/filter_bar.php'; ?>
 
         <div class="card-body no-pad">
             <?php if (empty($beneficiaries)): ?>
@@ -130,15 +103,16 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
             </div>
             <?php else: ?>
             <div class="tbl-wrap">
-                <table data-paginate="10">
+                <table>
                     <thead>
                         <tr>
-                            <th>Beneficiary</th>
-                            <th>Phone</th>
-                            <th>Town</th>
-                            <th>Total Aids</th>
-                            <th>Approved</th>
-                            <th>Last Request</th>
+                            <th><?= table_sort_link($table, 'name', 'Beneficiary') ?></th>
+                            <th><?= table_sort_link($table, 'phone', 'Phone') ?></th>
+                            <th><?= table_sort_link($table, 'barangay', 'Town') ?></th>
+                            <th><?= table_sort_link($table, 'status', 'Status') ?></th>
+                            <th><?= table_sort_link($table, 'total', 'Total Aids') ?></th>
+                            <th><?= table_sort_link($table, 'approved', 'Approved') ?></th>
+                            <th><?= table_sort_link($table, 'registered', 'Registered') ?></th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -162,6 +136,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                         </td>
                         <td style="font-family:monospace;font-size:.8rem;color:var(--muted);"><?= htmlspecialchars($b['phone'] ?? '—') ?></td>
                         <td><?= htmlspecialchars($b['barangay'] ?? '—') ?></td>
+                        <td><?= htmlspecialchars(ucfirst($b['status'] ?? 'active'), ENT_QUOTES, 'UTF-8') ?></td>
                         <td>
                             <div style="display:flex;align-items:center;gap:8px;">
                                 <span style="font-weight:700;color:var(--navy);font-size:.84rem;"><?= $total ?></span>
@@ -197,6 +172,7 @@ $colors        = ['#1a56db','#16a34a','#ca8a04','#dc2626','#7c3aed','#0891b2'];
                     </tbody>
                 </table>
             </div>
+            <?php include 'partials/table_pager.php'; ?>
             <?php endif; ?>
         </div>
     </div>

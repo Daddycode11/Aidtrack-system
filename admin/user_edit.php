@@ -1,7 +1,8 @@
 <?php
 // admin/user_edit.php
 require_once __DIR__ . '/../helpers.php';
-require_admin();
+require_once __DIR__ . '/../helpers/mailer.php';
+require_super_admin();
 
 $admin_id = $_SESSION['user']['id'] ?? 0;
 $is_sa    = is_super_admin();
@@ -10,7 +11,7 @@ $is_sa    = is_super_admin();
 $id = (int)($_GET['id'] ?? $_POST['user_id'] ?? 0);
 if (!$id) { header('Location: user.php'); exit; }
 
-$stmt = $mysqli->prepare("SELECT id, name, phone, barangay, role, status, created_at FROM users WHERE id = ?");
+$stmt = $mysqli->prepare("SELECT id, name, phone, email, email_verified, barangay, role, status, created_at FROM users WHERE id = ?");
 $stmt->bind_param('i', $id);
 $stmt->execute();
 $target = $stmt->get_result()->fetch_assoc();
@@ -34,10 +35,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
 
     $name     = trim($_POST['name'] ?? '');
     $phone    = trim($_POST['phone'] ?? '');
+    $email    = trim($_POST['email'] ?? ($target['email'] ?? ''));
     $barangay = trim($_POST['barangay'] ?? '');
     $role     = $_POST['role'] ?? $target['role'];
 
-    $old = ['id' => $id, 'name' => $name, 'phone' => $phone, 'barangay' => $barangay, 'role' => $role, 'status' => $target['status'], 'created_at' => $target['created_at']];
+    $old = ['id' => $id, 'name' => $name, 'phone' => $phone, 'email' => $email, 'barangay' => $barangay, 'role' => $role, 'status' => $target['status'], 'created_at' => $target['created_at']];
 
     if ($name === '')  $errors[] = 'Full name is required.';
     if ($phone === '') $errors[] = 'Phone number is required.';
@@ -55,6 +57,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
         $errors[] = 'Super Admin role cannot be changed from this screen.';
     }
 
+    if (in_array($role, ['admin', 'super_admin'], true) && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'A valid email address is required for admin accounts.';
+    } elseif ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'Email address format is invalid.';
+    }
+
     // Phone uniqueness check (excluding self)
     if (!$errors) {
         $chk = $mysqli->prepare("SELECT id FROM users WHERE phone = ? AND id != ? LIMIT 1");
@@ -64,22 +72,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
         $chk->close();
     }
 
+    if (!$errors && $email !== '') {
+        $chk = $mysqli->prepare("SELECT id FROM users WHERE email = ? AND id != ? LIMIT 1");
+        $chk->bind_param('si', $email, $id);
+        $chk->execute();
+        if ($chk->get_result()->fetch_assoc()) $errors[] = 'Email address is already used by another account.';
+        $chk->close();
+    }
+
     if (!$errors) {
-        $upd = $mysqli->prepare("UPDATE users SET name=?, phone=?, barangay=?, role=? WHERE id=?");
-        $upd->bind_param('ssssi', $name, $phone, $barangay, $role, $id);
+        $emailValue = $email === '' ? null : $email;
+        $emailChanged = $email !== (string)($target['email'] ?? '');
+        $promotedToAdmin = in_array($role, ['admin', 'super_admin'], true)
+            && !in_array($target['role'], ['admin', 'super_admin'], true);
+        $sendVerification = in_array($role, ['admin', 'super_admin'], true) && ($emailChanged || $promotedToAdmin);
+
+        if ($sendVerification) {
+            $verified = 0;
+            $upd = $mysqli->prepare("UPDATE users SET name=?, phone=?, email=?, email_verified=?, verification_token_hash=NULL, verification_expires=NULL, barangay=?, role=? WHERE id=?");
+            $upd->bind_param('sssissi', $name, $phone, $emailValue, $verified, $barangay, $role, $id);
+        } else {
+            $upd = $mysqli->prepare("UPDATE users SET name=?, phone=?, email=?, barangay=?, role=? WHERE id=?");
+            $upd->bind_param('sssssi', $name, $phone, $emailValue, $barangay, $role, $id);
+        }
         $upd->execute();
         $upd->close();
+
+        $emailSent = !$sendVerification || send_verification_email($mysqli, $id, $email, $name);
 
         $changes = [];
         if ($name !== $target['name'])         $changes[] = "name: '{$target['name']}' → '{$name}'";
         if ($phone !== $target['phone'])       $changes[] = "phone: '{$target['phone']}' → '{$phone}'";
+        if ($emailChanged)                     $changes[] = 'email address changed';
         if ($barangay !== $target['barangay']) $changes[] = "barangay: '{$target['barangay']}' → '{$barangay}'";
         if ($role !== $target['role'])         $changes[] = "role: '{$target['role']}' → '{$role}'";
 
         log_audit($mysqli, 'update_user', 'user', $id,
             $changes ? 'Updated fields — ' . implode(', ', $changes) : 'No field changes saved');
 
-        header('Location: user_edit.php?id=' . $id . '&toast=updated');
+        header('Location: user_edit.php?id=' . $id . '&toast=' . ($emailSent ? 'updated' : 'verification_failed'));
         exit;
     }
 }
@@ -171,7 +202,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'reset
         $errors[] = 'Password confirmation does not match.';
     } else {
         $hash = password_hash($new_pass, PASSWORD_DEFAULT);
-        $upd = $mysqli->prepare("UPDATE users SET password=? WHERE id=?");
+        $upd = $mysqli->prepare("UPDATE users SET password_hash=? WHERE id=?");
         $upd->bind_param('si', $hash, $id);
         $upd->execute();
         $upd->close();
@@ -326,6 +357,7 @@ function role_badge(string $role): string {
             'pw_reset'      => 'Password reset successfully.',
             'doc_flagged'   => 'Document flagged as invalid. The beneficiary has been notified.',
             'doc_unflagged' => 'Document marked as valid again.',
+            'verification_failed' => 'Account updated, but the verification email could not be sent. Check SMTP settings and resend the link.',
             default         => 'User details updated successfully.'
         } ?>
     </div>
@@ -376,6 +408,13 @@ function role_badge(string $role): string {
                     <label for="phone">Phone Number</label>
                     <input type="text" id="phone" name="phone" value="<?= htmlspecialchars($old['phone']) ?>" required>
                 </div>
+                <?php if (in_array($target['role'], ['admin', 'super_admin'], true) || $can_change_role): ?>
+                <div class="f-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" value="<?= htmlspecialchars($old['email'] ?? '', ENT_QUOTES, 'UTF-8') ?>" <?= in_array($old['role'], ['admin', 'super_admin'], true) ? 'required' : '' ?>>
+                    <div class="f-hint">Admin accounts sign in with this address and must verify it.</div>
+                </div>
+                <?php endif; ?>
                 <div class="f-group">
                     <label for="barangay">Barangay</label>
                     <input type="text" id="barangay" name="barangay" value="<?= htmlspecialchars($old['barangay'] ?? '') ?>">

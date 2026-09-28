@@ -64,7 +64,43 @@ document.querySelectorAll('.nav-link').forEach(link => {
 // e.g. <table data-paginate="10"> will show 10 rows per page
 document.addEventListener('DOMContentLoaded', function() {
     document.querySelectorAll('table[data-paginate]').forEach(initPagination);
+    document.querySelectorAll('[data-table-filter-form]').forEach(initTableFilterForm);
 });
+
+function toggleTableFilters(button) {
+    const form = button.parentElement.querySelector('.tf-form');
+    const open = form.classList.toggle('open');
+    button.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function changeTablePageSize(select) {
+    const url = new URL(window.location.href);
+    url.searchParams.set(select.dataset.perPageParam || 'per_page', select.value);
+    url.searchParams.set(select.dataset.pageParam || 'page', '1');
+    window.location.assign(url.toString());
+}
+
+function initTableFilterForm(form) {
+    const submit = () => {
+        const page = form.querySelector('input[name="page"]');
+        if (page) page.remove();
+        form.requestSubmit();
+    };
+    let timer;
+    form.querySelectorAll('[data-debounce-search]').forEach(input => {
+        input.addEventListener('input', () => {
+            clearTimeout(timer);
+            timer = setTimeout(submit, 300);
+        });
+        input.addEventListener('keydown', event => {
+            if (event.key === 'Enter') {
+                clearTimeout(timer);
+                submit();
+            }
+        });
+    });
+    form.querySelectorAll('[data-auto-apply]').forEach(input => input.addEventListener('change', submit));
+}
 
 function initPagination(table) {
     const perPage = parseInt(table.dataset.paginate) || 10;

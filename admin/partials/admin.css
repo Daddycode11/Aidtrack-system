@@ -144,6 +144,33 @@ tbody tr:hover { background:#fafbfc; }
 .filter-bar select:focus { border-color:var(--brand); background:var(--white); }
 .filter-bar input { min-width:180px; }
 
+/* Server-side table filters and pagination */
+.tf-wrap { padding:12px 18px; border-bottom:1px solid var(--border); background:var(--bg); }
+.tf-toggle { display:none; align-items:center; gap:7px; border:1px solid var(--border); border-radius:7px; padding:7px 10px; background:var(--white); color:var(--slate); font-family:inherit; font-size:.78rem; font-weight:600; cursor:pointer; }
+.tf-form { display:flex; flex-direction:column; gap:10px; }
+.tf-fields { display:flex; align-items:flex-end; gap:9px; flex-wrap:wrap; }
+.tf-field { display:flex; flex-direction:column; gap:4px; min-width:145px; font-size:.7rem; font-weight:700; color:var(--slate); }
+.tf-field input,.tf-field select { min-width:0; width:100%; font-family:inherit; font-size:.78rem; font-weight:400; color:var(--navy); background:var(--white); border:1.5px solid var(--border); border-radius:7px; padding:7px 9px; outline:none; }
+.tf-field input:focus,.tf-field select:focus { border-color:var(--brand); }
+.tf-actions,.tf-chips { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.tf-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--border); border-radius:99px; background:var(--white); color:var(--slate); font-size:.7rem; font-weight:600; }
+.tf-chip:hover { border-color:var(--brand); color:var(--brand); }
+.tf-sort { color:inherit; display:inline-flex; align-items:center; gap:3px; }
+.tf-sort:hover { color:var(--brand); }
+.tf-pager { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; padding:11px 18px; border-top:1px solid var(--border); color:var(--muted); font-size:.76rem; }
+.tf-page-size,.tf-page-links { display:flex; align-items:center; gap:7px; }
+.tf-page-size select { padding:4px 7px; border:1px solid var(--border); border-radius:6px; background:var(--white); color:var(--slate); }
+.tf-page-links a { min-width:29px; padding:5px 8px; text-align:center; border:1px solid var(--border); border-radius:6px; color:var(--slate); background:var(--white); }
+.tf-page-links a.active,.tf-page-links a:hover { background:var(--brand); border-color:var(--brand); color:#fff; }
+@media(max-width:700px) {
+    .tf-toggle { display:inline-flex; }
+    .tf-form { display:none; padding-top:10px; }
+    .tf-form.open { display:flex; }
+    .tf-fields { display:grid; grid-template-columns:1fr 1fr; }
+    .tf-field { min-width:0; }
+}
+@media(max-width:420px) { .tf-fields { grid-template-columns:1fr; } .tf-pager { align-items:flex-start; } }
+
 /* ── COUNT PILL ── */
 .count-pill { display:inline-flex; align-items:center; justify-content:center; background:var(--bg); border:1px solid var(--border); border-radius:99px; font-size:.7rem; font-weight:700; color:var(--muted); padding:2px 10px; }
 

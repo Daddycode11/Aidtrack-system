@@ -1,6 +1,7 @@
 <?php
 // admin/budget.php — Budget Management (Super Admin only)
 require_once __DIR__ . '/../helpers.php';
+require_once __DIR__ . '/../helpers/table_filters.php';
 require_super_admin();
 
 // --- Handle Update ---
@@ -24,8 +25,25 @@ $used_by_type = [];
 $res = $mysqli->query("SELECT type, COALESCE(SUM(amount_released),0) AS used FROM applications WHERE status='approved' GROUP BY type");
 if ($res) while ($r = $res->fetch_assoc()) $used_by_type[$r['type']] = floatval($r['used']);
 
-// --- Fetch Budgets ---
-$budgets = $mysqli->query("SELECT * FROM budgets ORDER BY type ASC")->fetch_all(MYSQLI_ASSOC);
+$budgetTypes = array_column($mysqli->query('SELECT DISTINCT type FROM budgets ORDER BY type')->fetch_all(MYSQLI_ASSOC), 'type');
+$typeOptions = array_combine($budgetTypes, array_map('ucfirst', $budgetTypes)) ?: [];
+$yearRows = $mysqli->query('SELECT DISTINCT YEAR(updated_at) AS year FROM budgets ORDER BY year DESC')->fetch_all(MYSQLI_ASSOC);
+$yearOptions = [];
+foreach ($yearRows as $yearRow) if ($yearRow['year']) $yearOptions[(string)$yearRow['year']] = (string)$yearRow['year'];
+$monthOptions = [1=>'January',2=>'February',3=>'March',4=>'April',5=>'May',6=>'June',7=>'July',8=>'August',9=>'September',10=>'October',11=>'November',12=>'December'];
+$table = table_filter_query($mysqli, [
+    'from_sql'=>'FROM budgets',
+    'select_sql'=>'id, type, allocated_budget, used_budget, max_amount, reapply_interval_months, updated_at',
+    'filters'=>[
+        'year'=>['kind'=>'select','label'=>'Fiscal year (last updated)','options'=>$yearOptions,'sql'=>'YEAR(updated_at)'],
+        'month'=>['kind'=>'select','label'=>'Month (last updated)','options'=>$monthOptions,'sql'=>'MONTH(updated_at)'],
+        'category'=>['kind'=>'select','label'=>'Category','options'=>$typeOptions,'sql'=>'type'],
+        'status'=>['kind'=>'select','label'=>'Budget status','options'=>['available'=>'Available','depleted'=>'Depleted'],'expressions'=>['available'=>'allocated_budget > used_budget','depleted'=>'allocated_budget <= used_budget']],
+    ],
+    'sort'=>['category'=>'type','allocated'=>'allocated_budget','used'=>'used_budget','updated'=>'updated_at'],
+    'default_sort'=>'category','default_dir'=>'ASC','per_page'=>25,
+]);
+$budgets = $table['rows'];
 
 // Update used_budget column to reflect actuals
 foreach ($budgets as &$b) {
@@ -134,6 +152,7 @@ $type_colors = [
     </div>
 
     <!-- Budget Cards -->
+    <?php include 'partials/filter_bar.php'; ?>
     <div class="budget-grid">
         <?php foreach ($budgets as $b):
             $alloc = floatval($b['allocated_budget']);
@@ -163,6 +182,7 @@ $type_colors = [
         </div>
         <?php endforeach; ?>
     </div>
+    <?php include 'partials/table_pager.php'; ?>
 
     <?php if (empty($budgets)): ?>
     <div class="card">
